@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { readChatStream } from "../lib/read-chat-stream";
 
 export default function Chat() {
   const [message, setMessage] = useState("");
@@ -33,8 +34,13 @@ export default function Chat() {
       throw new Error("Failed to generate response");
     }
 
-    const data = await response.json();
-    setReply(data.answer);
+    if (!response.body) {
+      throw new Error("Response body is not readable");
+    }
+
+    await readChatStream(response.body, (content) => {
+      setReply((current) => current + content);
+    });
   } catch (err) {
     setError(
       err instanceof Error ? err.message : "Something went wrong"

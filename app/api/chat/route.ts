@@ -19,6 +19,7 @@ export async function POST(req: Request) {
       },
       body: JSON.stringify({
         model: "nvidia/nemotron-3-ultra-550b-a55b:free",
+        stream: true,
         messages: [
           {
             role: "user",
@@ -36,9 +37,15 @@ export async function POST(req: Request) {
     );
   }
 
-  const data = await response.json();
+  if (!response.body) {
+    return Response.json({ error: "OpenRouter returned no stream" }, { status: 502 });
+  }
 
-  return Response.json({
-    answer: data.choices[0]?.message?.content ?? "",
+  return new Response(response.body, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "X-Accel-Buffering": "no",
+    },
   });
 }
