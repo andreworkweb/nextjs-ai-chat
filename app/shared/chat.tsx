@@ -1,60 +1,28 @@
 "use client";
 
-import { useState } from "react";
-import { readChatStream } from "../lib/read-chat-stream";
+import { useChat } from "../lib/chat-context/use-chat";
+import Link from "next/link";
 
 export default function Chat() {
-  const [message, setMessage] = useState("");
-  const [reply, setReply] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-
-  async function askAI() {
-  if (!message.trim() || loading) return;
-
-  const userMessage = message;
-  setMessage(""); // Clear input immediately
-
-  setLoading(true);
-  setError("");
-  setReply("");
-
-  try {
-    const response = await fetch("/api/chat", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        message: userMessage,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error("Failed to generate response");
-    }
-
-    if (!response.body) {
-      throw new Error("Response body is not readable");
-    }
-
-    await readChatStream(response.body, (content) => {
-      setReply((current) => current + content);
-    });
-  } catch (err) {
-    setError(
-      err instanceof Error ? err.message : "Something went wrong"
-    );
-  } finally {
-    setLoading(false);
-  }
-}
+  const {
+    message, setMessage, reply, loading, ready, error, askAI, clearConversation,
+  } = useChat();
 
   return (
     <main className="flex min-h-dvh flex-col bg-black text-white">
       <header className="border-b border-[#0f0f0f] px-4 py-4 sm:px-6">
         <div className="mx-auto w-full max-w-3xl">
-          <h1 className="text-sm font-semibold">Chat AI</h1>
+          <Link
+            href=''
+            title="Clear history and start a new conversation"
+            aria-label="Clear history and start a new conversation"
+            onClick={(event) => {
+              event.preventDefault();
+              clearConversation();
+            }}
+          >
+          <h1 className="text-md font-semibold">Chat AI</h1>
+          </Link>
         </div>
       </header>
 
@@ -94,7 +62,7 @@ export default function Chat() {
           />
           <button
             type="submit"
-            disabled={loading || !message.trim()}
+            disabled={!ready || loading || !message.trim()}
             className="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg bg-[#292929] px-3 py-2 text-xs text-white transition-colors hover:bg-[#383838] disabled:cursor-not-allowed disabled:opacity-50"
           >
             {loading ? "Generating..." : "Ask AI"}
