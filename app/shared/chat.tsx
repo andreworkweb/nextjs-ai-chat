@@ -45,7 +45,7 @@ export default function Chat() {
   }, [conversation, reply, error, message]);
 
   return (
-    <main className="flex h-dvh min-h-0 flex-col overflow-hidden bg-[#171717] font-sans text-[#ececec]">
+    <main className="flex h-dvh min-h-0 flex-col overflow-hidden bg-[#111111] font-sans text-[#ececec]">
       <header className="shrink-0 px-4 py-4 sm:px-6">
         <div className="mx-auto flex w-full max-w-3xl items-center justify-between gap-4">
           <div className="flex items-center gap-2.5">

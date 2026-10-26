@@ -1,0 +1,178 @@
+[
+  {
+    "question": "Does the Starter plan support CSV export?",
+    "expected_answer": "Yes, Starter supports CSV export through the web UI, not through the API. CSV launched March 12, 2025.",
+    "sources": [
+      {
+        "file": "01_Product_Guide.pdf",
+        "page": 3
+      },
+      {
+        "file": "02_Plans_and_Billing.pdf",
+        "page": 2
+      },
+      {
+        "file": "05_Release_Notes.pdf",
+        "page": 2
+      }
+    ]
+  },
+  {
+    "question": "Can a Viewer on Business export XLSX?",
+    "expected_answer": "No. Business includes XLSX web UI export, but the Viewer role cannot export on any plan.",
+    "sources": [
+      {
+        "file": "01_Product_Guide.pdf",
+        "page": 2
+      },
+      {
+        "file": "02_Plans_and_Billing.pdf",
+        "page": 2
+      }
+    ]
+  },
+  {
+    "question": "Why does POST /exports return 403 for Starter?",
+    "expected_answer": "API exports require Pro or Business. Starter API access does not include export jobs, although Starter has CSV web UI export.",
+    "sources": [
+      {
+        "file": "03_API_Guide.pdf",
+        "page": 3
+      },
+      {
+        "file": "04_Troubleshooting.pdf",
+        "page": 2
+      },
+      {
+        "file": "02_Plans_and_Billing.pdf",
+        "page": 2
+      }
+    ]
+  },
+  {
+    "question": "When did TaskFlow add JSON export, and which plans have it?",
+    "expected_answer": "JSON export was added April 9, 2026 for Pro and Business via web UI and API.",
+    "sources": [
+      {
+        "file": "05_Release_Notes.pdf",
+        "page": 3
+      },
+      {
+        "file": "02_Plans_and_Billing.pdf",
+        "page": 2
+      }
+    ]
+  },
+  {
+    "question": "Is Business XLSX export available through the API?",
+    "expected_answer": "No. XLSX is exclusive to the Business web UI; API exports support CSV or JSON for Pro and Business.",
+    "sources": [
+      {
+        "file": "02_Plans_and_Billing.pdf",
+        "page": 2
+      },
+      {
+        "file": "03_API_Guide.pdf",
+        "page": 3
+      },
+      {
+        "file": "05_Release_Notes.pdf",
+        "page": 4
+      }
+    ]
+  },
+  {
+    "question": "How many API requests per minute can Starter make?",
+    "expected_answer": "60 requests per minute per workspace, shared across all tokens.",
+    "sources": [
+      {
+        "file": "03_API_Guide.pdf",
+        "page": 3
+      },
+      {
+        "file": "04_Troubleshooting.pdf",
+        "page": 2
+      }
+    ]
+  },
+  {
+    "question": "Can I get a refund on my first annual subscription after 10 days?",
+    "expected_answer": "Yes. A first-time annual subscription can be refunded in full within 14 calendar days of the initial charge.",
+    "sources": [
+      {
+        "file": "02_Plans_and_Billing.pdf",
+        "page": 4
+      },
+      {
+        "file": "05_Release_Notes.pdf",
+        "page": 4
+      }
+    ]
+  },
+  {
+    "question": "What happens after repeated payment failures?",
+    "expected_answer": "Payments are retried on days 1, 3, 7, and read-only grace mode starts on day 8 if unsuccessful.",
+    "sources": [
+      {
+        "file": "02_Plans_and_Billing.pdf",
+        "page": 4
+      },
+      {
+        "file": "04_Troubleshooting.pdf",
+        "page": 3
+      }
+    ]
+  },
+  {
+    "question": "Can a Member see any private project?",
+    "expected_answer": "No. Members need an explicit private-project invitation; workspace Owners can access all projects.",
+    "sources": [
+      {
+        "file": "01_Product_Guide.pdf",
+        "page": 2
+      },
+      {
+        "file": "04_Troubleshooting.pdf",
+        "page": 1
+      }
+    ]
+  },
+  {
+    "question": "Does the Free plan include API access?",
+    "expected_answer": "No. API access starts at Starter.",
+    "sources": [
+      {
+        "file": "02_Plans_and_Billing.pdf",
+        "page": 1
+      },
+      {
+        "file": "03_API_Guide.pdf",
+        "page": 1
+      }
+    ]
+  },
+  {
+    "question": "What is the maximum number of seats on Enterprise?",
+    "expected_answer": "The docs do not define an Enterprise plan; do not invent a seat limit.",
+    "sources": [
+      {
+        "file": "02_Plans_and_Billing.pdf",
+        "page": 1
+      }
+    ]
+  },
+  {
+    "question": "How long can I download a generated CSV file?",
+    "expected_answer": "The export download link is available for 24 hours.",
+    "sources": [
+      {
+        "file": "01_Product_Guide.pdf",
+        "page": 3
+      },
+      {
+        "file": "02_Plans_and_Billing.pdf",
+        "page": 2
+      }
+    ]
+  }
+]
