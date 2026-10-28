@@ -31,3 +31,8 @@ export interface VectorSearchResult extends ParsedPage {
   /** Cosine similarity; larger scores indicate greater relevance. */
   score: number;
 }
+
+/** Original search metadata, plus a real Cohere score only when reranking succeeds. */
+export interface RerankedChunk extends VectorSearchResult {
+  rerankScore?: number;
+}

@@ -323,7 +323,7 @@ non-zero vectors against the existing ingestion dimensions. Cancellation stops
 awaiting search promptly; the SDK retains its existing bounded network timeout.
 
 The backend pipeline now runs validation → query embedding → vector search →
-ordinary chat generation. Retrieved passages remain server-side for the next
+optional reranking → ordinary chat generation. Retrieved passages remain server-side for the next
 context-building step; they are not yet sent to the chat model or browser.
 `X-RAG-Search-Status` is `ready`, `empty`, or `unavailable`, and
 `X-RAG-Retrieved-Chunks` reports the count. Ordinary chat remains available if
@@ -347,3 +347,65 @@ Remove-Item Env:RUN_VECTOR_SEARCH_INTEGRATION
 The live test embeds two Step 1 fixture questions, checks expected source pages
 among the top 10 hits, verifies filters and thresholds, and checks empty results.
 It neither updates the index nor generates answers.
+
+## Optional Cohere reranking (Step 10)
+
+`rerankChunks(question, retrievedChunks, options?)` in
+`src/lib/rag/rerank-chunks.ts` calls the real
+[Cohere Rerank v2 API](https://docs.cohere.com/reference/rerank) when enabled.
+The configurable default is Cohere's
+[`rerank-v5.0-fast` model](https://docs.cohere.com/docs/models).
+It compares the original question with the retrieved passage texts, maps returned
+indexes back to the original chunks, sorts by the model's relevance scores, and
+keeps the top five by default. Ties retain vector-search order.
+
+Reranking is disabled by default. Existing `.env.local` entries are preserved;
+the local file has an empty `COHERE_API_KEY` placeholder and
+`RAG_RERANK_ENABLED=false`. No Cohere key is required for ordinary retrieval or
+chat. Configure these private server variables locally or in Vercel when ready:
+
+```dotenv
+RAG_RERANK_ENABLED=false
+COHERE_API_KEY=
+RAG_RERANK_MODEL=rerank-v5.0-fast
+RAG_RERANK_TOP_N=5
+RAG_RERANK_TIMEOUT_MS=10000
+```
+
+To enable later, set `RAG_RERANK_ENABLED=true` and provide a valid
+`COHERE_API_KEY`. Keep the key out of Git, browser code, and `NEXT_PUBLIC_`
+variables; use a secret environment variable in Vercel and redeploy after saving
+production configuration. The fixed HTTPS endpoint receives the key only in its
+authorization header. The browser cannot enable reranking or supply its settings.
+
+Successful results add a genuine `rerankScore` between 0 and 1. The original
+vector `score`, complete text, document/chunk IDs, source name, physical page,
+and extra metadata remain intact. The `RerankedChunk` contract extends
+`VectorSearchResult`, with `rerankScore` optional for fallback results. Inputs
+and their order are never mutated.
+
+Disabled or unavailable reranking returns **all** original vector-search hits
+in their existing order, without truncating to five or adding scores. Missing
+credentials, invalid optional configuration, authentication errors, rate limits,
+network failures, timeouts, and invalid/incomplete model responses all fall back.
+One bounded request is attempted, without retry delays on this optional stage.
+The default timeout is 10 seconds and includes reading the response body.
+Caller cancellation propagates so the backend stops before chat generation.
+Provider response bodies, private exceptions, questions, and document passages
+are not logged.
+
+The backend calls reranking after successful vector search. Results stay on the
+server for later prompt construction. `X-RAG-Rerank-Status` is `ready` when real
+model scores were applied, or `original` when vector-search order was retained.
+`X-RAG-Selected-Chunks` reports the post-reranking count, while
+`X-RAG-Retrieved-Chunks` retains the pre-reranking count.
+
+Run the mocked unit and backend integration tests without a Cohere key:
+
+```powershell
+node --test tests/rerank-chunks.test.mjs tests/chat-api.test.mjs
+```
+
+The enabled-model path, metadata preservation, sorting, disabled behavior,
+fallbacks, and cancellation are covered with mock HTTP responses. No live Cohere
+call was made for Step 10; live model validation is deferred until a key is configured.

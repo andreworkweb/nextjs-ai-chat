@@ -10,7 +10,7 @@ import {
 } from "../src/lib/rag/chat-request.ts";
 
 const originalKey = process.env.OPENROUTER_API_KEY;
-const serverSettings = ["RAG_EMBEDDING_MODEL", "RAG_EMBEDDING_DIMENSIONS", "RAG_EMBEDDING_BATCH_SIZE", "RAG_EMBEDDING_TIMEOUT_MS", "RAG_EMBEDDING_MAX_RETRIES", "QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION", "RAG_SEARCH_LIMIT", "RAG_SEARCH_MIN_SCORE"];
+const serverSettings = ["RAG_EMBEDDING_MODEL", "RAG_EMBEDDING_DIMENSIONS", "RAG_EMBEDDING_BATCH_SIZE", "RAG_EMBEDDING_TIMEOUT_MS", "RAG_EMBEDDING_MAX_RETRIES", "QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION", "RAG_SEARCH_LIMIT", "RAG_SEARCH_MIN_SCORE", "COHERE_API_KEY", "RAG_RERANK_ENABLED", "RAG_RERANK_MODEL", "RAG_RERANK_TOP_N", "RAG_RERANK_TIMEOUT_MS"];
 const originalServerSettings = new Map(serverSettings.map((name) => [name, process.env[name]]));
 const streamText = 'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\ndata: [DONE]\n\n';
 
@@ -36,6 +36,7 @@ beforeEach(() => {
   process.env.OPENROUTER_API_KEY = "test-only-key";
   for (const name of serverSettings) delete process.env[name];
   process.env.RAG_EMBEDDING_MAX_RETRIES = "0";
+  process.env.RAG_RERANK_ENABLED = "false";
   process.env.QDRANT_URL = "https://unit.eu-central.aws.cloud.qdrant.io:6333";
   process.env.QDRANT_API_KEY = "fake-qdrant-test-key";
   process.env.QDRANT_COLLECTION = "unit_documents";
@@ -415,4 +416,103 @@ test("cancelling vector search prevents chat generation", async () => {
   });
   await expectError(request({ question: "Hi" }, { signal: controller.signal }), 499, "REQUEST_CANCELLED");
   assert.equal(globalThis.fetch.mock.callCount(), 1);
+});
+
+function retrievedPoints(count = 8) {
+  return { points: Array.from({ length: count }, (_, index) => ({
+    id: `scoped-point-${index}`, score: 0.95 - index / 100,
+    payload: {
+      id: `original-chunk-${index}`, documentId: "original-document", sourceName: "guide.pdf",
+      pageNumber: index + 1, chunkIndex: 0, text: `Original retrieved passage ${index}.`,
+    },
+  })) };
+}
+
+test("disabled reranking keeps every retrieved chunk and cannot be enabled by browser data", async () => {
+  process.env.COHERE_API_KEY = "fake-cohere-key";
+  mock.method(QdrantClient.prototype, "query", async () => retrievedPoints());
+  const response = await POST(request({ question: "Hi", rerank: true, rerankModel: "browser-model" }));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("X-RAG-Rerank-Status"), "original");
+  assert.equal(response.headers.get("X-RAG-Retrieved-Chunks"), "8");
+  assert.equal(response.headers.get("X-RAG-Selected-Chunks"), "8");
+  assert.equal(globalThis.fetch.mock.callCount(), 2);
+});
+
+test("the enabled backend reranks retrieved text with Cohere and selects the top five", async () => {
+  process.env.RAG_RERANK_ENABLED = "true";
+  process.env.COHERE_API_KEY = "fake-cohere-key";
+  const stages = [];
+  const points = retrievedPoints();
+  mock.method(QdrantClient.prototype, "query", async () => { stages.push("search"); return points; });
+  mock.method(globalThis, "fetch", async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === "https://openrouter.ai/api/v1/embeddings") {
+      stages.push("embed");
+      return embeddingResponse();
+    }
+    if (url === "https://api.cohere.com/v2/rerank") {
+      stages.push("rerank");
+      assert.equal(options.headers.Authorization, "Bearer fake-cohere-key");
+      assert.equal(body.query, "Which passage is relevant?");
+      assert.deepEqual(body.documents, points.points.map((point) => point.payload.text));
+      assert.equal(body.model, "rerank-v5.0-fast");
+      assert.equal(body.top_n, 5);
+      return Response.json({ results: [6, 2, 1, 7, 3].map((index, rank) => ({ index, relevance_score: 0.95 - rank / 10 })) });
+    }
+    stages.push("chat");
+    assert.ok(!options.body.includes("Original retrieved passage"));
+    return new Response(streamText);
+  });
+  const response = await POST(request({ question: "Which passage is relevant?" }));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("X-RAG-Rerank-Status"), "ready");
+  assert.equal(response.headers.get("X-RAG-Retrieved-Chunks"), "8");
+  assert.equal(response.headers.get("X-RAG-Selected-Chunks"), "5");
+  assert.equal(await response.text(), streamText);
+  assert.deepEqual(stages, ["embed", "search", "rerank", "chat"]);
+});
+
+test("missing Cohere credentials and unavailable reranking preserve retrieval and ordinary chat", async () => {
+  process.env.RAG_RERANK_ENABLED = "true";
+  mock.method(QdrantClient.prototype, "query", async () => retrievedPoints());
+  let response = await POST(request({ question: "Hi" }));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("X-RAG-Selected-Chunks"), "8");
+  assert.equal(response.headers.get("X-RAG-Rerank-Status"), "original");
+  process.env.COHERE_API_KEY = "fake-cohere-key";
+  for (const failure of [
+    () => new Response("private-cohere-details", { status: 429 }),
+    () => new Response("private-cohere-details", { status: 503 }),
+    () => Response.json({ results: [{ index: 0, relevance_score: null }] }),
+    () => { throw new Error("fake-cohere-key private-cohere-details"); },
+  ]) {
+    mock.method(globalThis, "fetch", async (url) => url === "https://openrouter.ai/api/v1/embeddings"
+      ? embeddingResponse() : url === "https://api.cohere.com/v2/rerank" ? failure() : new Response(streamText));
+    response = await POST(request({ question: "Hi" }));
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("X-RAG-Search-Status"), "ready");
+    assert.equal(response.headers.get("X-RAG-Rerank-Status"), "original");
+    assert.equal(response.headers.get("X-RAG-Selected-Chunks"), "8");
+    assert.equal(await response.text(), streamText);
+    assert.doesNotMatch(JSON.stringify([...response.headers]), /fake-cohere-key|private-cohere-details/);
+  }
+});
+
+test("client cancellation during reranking prevents chat generation", async () => {
+  process.env.RAG_RERANK_ENABLED = "true";
+  process.env.COHERE_API_KEY = "fake-cohere-key";
+  const controller = new AbortController();
+  mock.method(QdrantClient.prototype, "query", async () => retrievedPoints());
+  const upstream = mock.method(globalThis, "fetch", async (url, options) => {
+    if (url === "https://openrouter.ai/api/v1/embeddings") return embeddingResponse();
+    assert.equal(url, "https://api.cohere.com/v2/rerank");
+    const pending = new Promise((_resolve, reject) => {
+      options.signal.addEventListener("abort", () => reject(new DOMException("private reason", "AbortError")), { once: true });
+    });
+    controller.abort();
+    return pending;
+  });
+  await expectError(request({ question: "Hi" }, { signal: controller.signal }), 499, "REQUEST_CANCELLED");
+  assert.equal(upstream.mock.callCount(), 2);
 });

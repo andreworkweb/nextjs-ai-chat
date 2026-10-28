@@ -5,6 +5,7 @@ import { EmbeddingGenerationError } from "../../../lib/rag/generate-embeddings.t
 import { searchVectors } from "../../../lib/rag/search-vectors.ts";
 import { QdrantStorageError } from "../../../lib/rag/qdrant.ts";
 import type { VectorSearchResult } from "../../../lib/rag/types.ts";
+import { rerankChunks } from "../../../lib/rag/rerank-chunks.ts";
 
 // next.config.ts enables cacheComponents, which requires the Node.js runtime.
 // This Next.js version rejects route-level runtime exports with that setting.
@@ -50,7 +51,10 @@ export async function POST(request: Request): Promise<Response> {
       }
     }
     signal.throwIfAborted();
-    // Source passages are available for the next context-building step.
+    const selectedChunks = retrievedChunks === null ? null
+      : await rerankChunks(query.question, retrievedChunks, { signal });
+    signal.throwIfAborted();
+    // Selected passages are available for the next context-building step.
     const messages = buildContext({ ...query, message: query.question });
     generating = true;
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -95,6 +99,8 @@ export async function POST(request: Request): Promise<Response> {
         "X-RAG-Query-Status": queryVector ? "ready" : "unavailable",
         "X-RAG-Search-Status": retrievedChunks === null ? "unavailable" : retrievedChunks.length ? "ready" : "empty",
         "X-RAG-Retrieved-Chunks": String(retrievedChunks?.length ?? 0),
+        "X-RAG-Rerank-Status": selectedChunks?.some((chunk) => chunk.rerankScore !== undefined) ? "ready" : "original",
+        "X-RAG-Selected-Chunks": String(selectedChunks?.length ?? 0),
       },
     });
   } catch (error) {
