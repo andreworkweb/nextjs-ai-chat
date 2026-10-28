@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { basename, extname } from "node:path";
 import { PDFParse, PasswordException } from "pdf-parse";
+import { normalizeText } from "./normalize-text.ts";
 import type { ParsedPage } from "./types";
 
 export type ExtractionErrorCode =
@@ -51,7 +52,7 @@ function extractPlainText(data: Buffer, sourceName: string): string {
     );
   }
 
-  // Preserve Markdown formatting and text whitespace; never write to the source.
+  // Decode first; the shared normalizer cleans text without writing to the source.
   return text;
 }
 
@@ -77,10 +78,11 @@ async function extractPdf(
       documentId,
       sourceName,
       pageNumber: page.num,
-      text: page.text.trim(),
+      text: page.text,
     }));
+    const normalizedPages = normalizeText(pages);
 
-    if (!pages.some((page) => page.text.length > 0)) {
+    if (!normalizedPages.some((page) => page.text.trim().length > 0)) {
       throw new DocumentExtractionError(
         "OCR_REQUIRED",
         `"${sourceName}" has no extractable text. It may be scanned or image-only; OCR may be required.`,
@@ -88,7 +90,7 @@ async function extractPdf(
     }
 
     // Keep blank pages in mixed documents so physical page metadata stays intact.
-    return pages;
+    return normalizedPages;
   } catch (cause) {
     extractionFailed = true;
     if (cause instanceof DocumentExtractionError) throw cause;
@@ -124,6 +126,7 @@ async function extractPdf(
  * Read a local document on the Node.js server without changing the original.
  * TXT and Markdown are UTF-8 and return one logical page, numbered 1.
  * sourceName defaults to the filename and can preserve an original upload name.
+ * Returned page text is normalized; documentId still hashes the original bytes.
  */
 export async function extractText(
   filePath: string,
@@ -170,5 +173,11 @@ export async function extractText(
   const documentId = createHash("sha256").update(data).digest("hex");
   if (extension === ".pdf") return extractPdf(data, documentId, name);
 
-  return [{ documentId, sourceName: name, pageNumber: 1, text: extractPlainText(data, name) }];
+  const pages = normalizeText([
+    { documentId, sourceName: name, pageNumber: 1, text: extractPlainText(data, name) },
+  ]);
+  if (!pages[0].text.trim()) {
+    throw new DocumentExtractionError("EMPTY_FILE", `"${name}" contains no usable text after cleaning.`);
+  }
+  return pages;
 }

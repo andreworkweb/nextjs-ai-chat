@@ -73,42 +73,42 @@ function makePdf(pageStreams) {
   return Buffer.from(pdf, "ascii");
 }
 
-test("TXT extraction preserves UTF-8 text, source name, and page metadata", async () => {
+test("TXT extraction normalizes UTF-8 text and preserves source and page metadata", async () => {
   const file = path.join(fixtures, "sample.txt");
   const bytes = await readFile(file);
   assert.deepEqual(await extractText(file), [{
     documentId: hash(bytes),
     sourceName: "sample.txt",
     pageNumber: 1,
-    text: bytes.toString("utf8"),
+    text: bytes.toString("utf8").replace(/\r\n/g, "\n").trimEnd(),
   }]);
   assert.match((await extractText(file))[0].text, /Київ, café, 日本語, 🙂/);
 });
 
-test("Markdown extraction preserves headings, lists, code fences, and whitespace", async () => {
+test("Markdown extraction normalizes text and preserves headings, lists, and code fences", async () => {
   const file = path.join(fixtures, "sample.md");
   const [page] = await extractText(file);
-  assert.equal(page.text, await readFile(file, "utf8"));
+  assert.equal(page.text, (await readFile(file, "utf8")).replace(/\r\n/g, "\n").trimEnd());
   assert.equal(page.sourceName, "sample.md");
   assert.equal(page.pageNumber, 1);
   assert.match(page.text, /# TaskFlow export notes/);
   assert.match(page.text, /```text\r?\nPOST \/exports\r?\n```/);
 
   const indented = "    indented code\r\n\r\n- list item\r\n";
-  assert.equal((await extractText(await temporaryFile("indented.md", indented)))[0].text, indented);
+  assert.equal((await extractText(await temporaryFile("indented.md", indented)))[0].text, "    indented code\n\n- list item");
 });
 
 test("uppercase extensions and .markdown are supported", async () => {
   for (const extension of ["TXT", "MD", "MARKDOWN"]) {
     const file = await temporaryFile(`uppercase.${extension}`, "# Text content\n");
-    assert.equal((await extractText(file))[0].text, "# Text content\n");
+    assert.equal((await extractText(file))[0].text, "# Text content");
   }
 });
 
 test("a UTF-8 BOM is decoded while documentId still hashes the original bytes", async () => {
   const bytes = Buffer.from("\uFEFFHello, TaskFlow\n", "utf8");
   const [page] = await extractText(await temporaryFile("bom.txt", bytes));
-  assert.equal(page.text, "Hello, TaskFlow\n");
+  assert.equal(page.text, "Hello, TaskFlow");
   assert.equal(page.documentId, hash(bytes));
 });
 
@@ -167,9 +167,9 @@ test("all Step 1 PDFs extract with their physical page numbers and unchanged ori
 
 test("mixed PDFs retain blank pages and never renumber later text pages", async () => {
   const bytes = makePdf([
-    "BT /F1 12 Tf 32 700 Td (First page) Tj ET",
+    "BT /F1 12 Tf 32 700 Td (First   page) Tj ET",
     "",
-    "BT /F1 12 Tf 32 700 Td (Third page) Tj ET",
+    "BT /F1 12 Tf 32 700 Td (Third   page) Tj ET",
   ]);
   const file = await temporaryFile("mixed.pdf", bytes);
   const pages = await extractText(file, "Uploaded PDF");
@@ -179,6 +179,25 @@ test("mixed PDFs retain blank pages and never renumber later text pages", async 
   assert.ok(pages.every((page) => page.documentId === hash(bytes) && page.sourceName === "Uploaded PDF"));
   assert.equal((await extractText(file))[0].documentId, pages[0].documentId);
   assert.deepEqual(await readFile(file), bytes);
+});
+
+test("TXT and Markdown extraction automatically normalize content without changing source bytes or IDs", async () => {
+  for (const extension of ["txt", "md"]) {
+    const bytes = Buffer.from("First\u0007   paragraph.\r\nKeep\tline breaks.\r\n\r\n\r\nNext   paragraph.\r\n");
+    const file = await temporaryFile(`normalize.${extension}`, bytes);
+    assert.deepEqual(await extractText(file, "Original upload"), [{
+      documentId: hash(bytes),
+      sourceName: "Original upload",
+      pageNumber: 1,
+      text: "First paragraph.\nKeep line breaks.\n\nNext paragraph.",
+    }]);
+    assert.deepEqual(await readFile(file), bytes);
+  }
+});
+
+test("text that becomes empty after control-character cleanup is rejected", async () => {
+  const file = await temporaryFile("control-only.txt", "\u0007\u001b\u007f");
+  await assert.rejects(extractText(file), expectError("EMPTY_FILE", /no usable text after cleaning/));
 });
 
 test("blank and image-only PDFs report that OCR may be required", async () => {
