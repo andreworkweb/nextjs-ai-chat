@@ -7,3 +7,11 @@ export interface ParsedPage {
   pageNumber: number;
   text: string;
 }
+
+/** A searchable passage from exactly one physical source page. */
+export interface Chunk extends ParsedPage {
+  /** Deterministic UUID derived from the document, page, index, and chunk text. */
+  id: string;
+  /** Zero-based position within this page; order by pageNumber, then chunkIndex. */
+  chunkIndex: number;
+}
