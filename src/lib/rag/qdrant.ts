@@ -3,7 +3,8 @@ import type { Schemas } from "@qdrant/js-client-rest";
 import { env } from "node:process";
 
 export type QdrantErrorCode = "CONFIGURATION_ERROR" | "CONNECTION_ERROR"
-  | "COLLECTION_MISMATCH" | "INVALID_INPUT" | "WRITE_FAILED" | "VERIFICATION_FAILED";
+  | "COLLECTION_MISMATCH" | "INVALID_INPUT" | "WRITE_FAILED" | "VERIFICATION_FAILED"
+  | "SEARCH_FAILED" | "INVALID_RESPONSE" | "CANCELLED";
 
 /** Contains no credentials, provider response bodies, or raw transport causes. */
 export class QdrantStorageError extends Error {
@@ -20,7 +21,7 @@ export class QdrantStorageError extends Error {
 
 export interface QdrantConnection {
   client: Pick<QdrantClient, "getCollection" | "createCollection" | "createPayloadIndex"
-    | "upsert" | "retrieve" | "delete" | "count">;
+    | "upsert" | "retrieve" | "delete" | "count" | "query">;
   collection: string;
   dimensions: number;
 }

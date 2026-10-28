@@ -20,3 +20,14 @@ export interface Chunk extends ParsedPage {
 export interface EmbeddedChunk extends Chunk {
   embedding: number[];
 }
+
+/** A ranked passage with its original source metadata, ready for citations. */
+export interface VectorSearchResult extends ParsedPage {
+  /** Original chunk ID from the payload, independent of the scoped point ID. */
+  chunkId: string;
+  chunkIndex: number;
+  /** One-based physical page, also retained as pageNumber for ParsedPage users. */
+  page: number;
+  /** Cosine similarity; larger scores indicate greater relevance. */
+  score: number;
+}

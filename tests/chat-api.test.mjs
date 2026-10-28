@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, mock, test } from "node:test";
+import { QdrantClient } from "@qdrant/js-client-rest";
 import { POST } from "../src/app/api/chat/route.ts";
 import { POST as activePOST } from "../app/api/chat/route.ts";
 import {
@@ -9,8 +10,8 @@ import {
 } from "../src/lib/rag/chat-request.ts";
 
 const originalKey = process.env.OPENROUTER_API_KEY;
-const embeddingSettings = ["RAG_EMBEDDING_MODEL", "RAG_EMBEDDING_DIMENSIONS", "RAG_EMBEDDING_BATCH_SIZE", "RAG_EMBEDDING_TIMEOUT_MS", "RAG_EMBEDDING_MAX_RETRIES"];
-const originalEmbeddingSettings = new Map(embeddingSettings.map((name) => [name, process.env[name]]));
+const serverSettings = ["RAG_EMBEDDING_MODEL", "RAG_EMBEDDING_DIMENSIONS", "RAG_EMBEDDING_BATCH_SIZE", "RAG_EMBEDDING_TIMEOUT_MS", "RAG_EMBEDDING_MAX_RETRIES", "QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION", "RAG_SEARCH_LIMIT", "RAG_SEARCH_MIN_SCORE"];
+const originalServerSettings = new Map(serverSettings.map((name) => [name, process.env[name]]));
 const streamText = 'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\ndata: [DONE]\n\n';
 
 function embeddingResponse() {
@@ -33,8 +34,12 @@ function request(body, options = {}) {
 
 beforeEach(() => {
   process.env.OPENROUTER_API_KEY = "test-only-key";
-  for (const name of embeddingSettings) delete process.env[name];
+  for (const name of serverSettings) delete process.env[name];
   process.env.RAG_EMBEDDING_MAX_RETRIES = "0";
+  process.env.QDRANT_URL = "https://unit.eu-central.aws.cloud.qdrant.io:6333";
+  process.env.QDRANT_API_KEY = "fake-qdrant-test-key";
+  process.env.QDRANT_COLLECTION = "unit_documents";
+  mock.method(QdrantClient.prototype, "query", async () => ({ points: [] }));
   mockChatFetch(async () => new Response(streamText));
 });
 
@@ -42,7 +47,7 @@ afterEach(() => {
   mock.restoreAll();
   if (originalKey === undefined) delete process.env.OPENROUTER_API_KEY;
   else process.env.OPENROUTER_API_KEY = originalKey;
-  for (const [name, value] of originalEmbeddingSettings) {
+  for (const [name, value] of originalServerSettings) {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
   }
@@ -66,6 +71,8 @@ test("the active Next.js route forwards the question handler", async () => {
   assert.equal(response.status, 200);
   assert.match(response.headers.get("Content-Type"), /text\/event-stream/);
   assert.equal(response.headers.get("X-RAG-Query-Status"), "ready");
+  assert.equal(response.headers.get("X-RAG-Search-Status"), "empty");
+  assert.equal(response.headers.get("X-RAG-Retrieved-Chunks"), "0");
   assert.equal(await response.text(), streamText);
 });
 
@@ -312,8 +319,19 @@ test("an upstream response without a body is rejected", async () => {
   await expectError(request({ question: "Hi" }), 502, "AI_EMPTY_RESPONSE");
 });
 
-test("the backend embeds only the current question before generating a chat response", async () => {
+test("the backend embeds the current question, searches, and then generates a chat response", async () => {
   const stages = [];
+  mock.method(QdrantClient.prototype, "query", async (collection, options) => {
+    stages.push("search");
+    assert.equal(collection, "unit_documents");
+    assert.deepEqual(options.query, Array(1024).fill(0.25));
+    assert.equal(options.limit, 10);
+    assert.equal(options.filter, undefined);
+    return { points: [{ id: "scoped-point-id", score: 0.9, payload: {
+      id: "original-chunk-id", documentId: "document-id", sourceName: "guide.pdf",
+      pageNumber: 3, chunkIndex: 1, text: "Private retrieved passage stays on the server.",
+    } }] };
+  });
   mock.method(globalThis, "fetch", async (url, options) => {
     const body = JSON.parse(options.body);
     if (url === "https://openrouter.ai/api/v1/embeddings") {
@@ -325,10 +343,12 @@ test("the backend embeds only the current question before generating a chat resp
     stages.push("chat");
     assert.equal(body.messages.length, 3);
     assert.equal(body.queryVector, undefined);
+    assert.ok(!options.body.includes("Private retrieved passage"));
     return new Response(streamText);
   });
   const response = await POST(request({
     question: "Which color?",
+    filter: { documentIds: ["untrusted-browser-filter"] },
     history: [
       { id: "first:user", role: "user", content: "Remember blue" },
       { id: "first:assistant", role: "assistant", content: "I remember blue" },
@@ -336,8 +356,10 @@ test("the backend embeds only the current question before generating a chat resp
   }));
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("X-RAG-Query-Status"), "ready");
+  assert.equal(response.headers.get("X-RAG-Search-Status"), "ready");
+  assert.equal(response.headers.get("X-RAG-Retrieved-Chunks"), "1");
   assert.equal(await response.text(), streamText);
-  assert.deepEqual(stages, ["embed", "chat"]);
+  assert.deepEqual(stages, ["embed", "search", "chat"]);
 });
 
 test("ordinary chat remains available when query embedding fails safely", async () => {
@@ -352,6 +374,7 @@ test("ordinary chat remains available when query embedding fails safely", async 
     const response = await POST(request({ question: "Hi" }));
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("X-RAG-Query-Status"), "unavailable");
+    assert.equal(response.headers.get("X-RAG-Search-Status"), "unavailable");
     assert.equal(await response.text(), streamText);
     assert.doesNotMatch(JSON.stringify([...response.headers]), /private embedding|test-only-key/);
   }
@@ -369,4 +392,27 @@ test("cancelling query embedding does not start chat generation", async () => {
   });
   await expectError(request({ question: "Hi" }, { signal: controller.signal }), 499, "REQUEST_CANCELLED");
   assert.equal(upstream.mock.callCount(), 1);
+  assert.equal(QdrantClient.prototype.query.mock.callCount(), 0);
+});
+
+test("database failures preserve ordinary chat and do not expose private details", async () => {
+  mock.method(QdrantClient.prototype, "query", async () => {
+    throw Object.assign(new Error("fake-qdrant-test-key private database details"), { status: 503 });
+  });
+  const response = await POST(request({ question: "Hi" }));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("X-RAG-Search-Status"), "unavailable");
+  assert.equal(response.headers.get("X-RAG-Retrieved-Chunks"), "0");
+  assert.equal(await response.text(), streamText);
+  assert.doesNotMatch(JSON.stringify([...response.headers]), /fake-qdrant-test-key|private database/);
+});
+
+test("cancelling vector search prevents chat generation", async () => {
+  const controller = new AbortController();
+  mock.method(QdrantClient.prototype, "query", () => {
+    controller.abort();
+    return new Promise(() => {});
+  });
+  await expectError(request({ question: "Hi" }, { signal: controller.signal }), 499, "REQUEST_CANCELLED");
+  assert.equal(globalThis.fetch.mock.callCount(), 1);
 });

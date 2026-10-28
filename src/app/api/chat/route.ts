@@ -2,6 +2,9 @@ import { ChatQueryError, readChatQuery } from "../../../lib/rag/chat-request.ts"
 import { buildContext, MAX_COMPLETION_TOKENS } from "../../../../app/lib/chat-context/context.ts";
 import { embedQuery } from "../../../lib/rag/embed-query.ts";
 import { EmbeddingGenerationError } from "../../../lib/rag/generate-embeddings.ts";
+import { searchVectors } from "../../../lib/rag/search-vectors.ts";
+import { QdrantStorageError } from "../../../lib/rag/qdrant.ts";
+import type { VectorSearchResult } from "../../../lib/rag/types.ts";
 
 // next.config.ts enables cacheComponents, which requires the Node.js runtime.
 // This Next.js version rejects route-level runtime exports with that setting.
@@ -27,7 +30,7 @@ export async function POST(request: Request): Promise<Response> {
       request.signal,
       AbortSignal.timeout(GENERATION_TIMEOUT_MS),
     ]);
-    // This vector is the input for the next retrieval stage; keep it server-side.
+    // Keep the query vector and retrieved source passages on the server.
     let queryVector: number[] | null = null;
     try {
       queryVector = await embedQuery(query.question, { signal });
@@ -37,6 +40,17 @@ export async function POST(request: Request): Promise<Response> {
       if (!(error instanceof EmbeddingGenerationError)) throw error;
     }
     signal.throwIfAborted();
+    let retrievedChunks: VectorSearchResult[] | null = null;
+    if (queryVector) {
+      try {
+        retrievedChunks = await searchVectors(queryVector, { signal });
+      } catch (error) {
+        signal.throwIfAborted();
+        if (!(error instanceof QdrantStorageError)) throw error;
+      }
+    }
+    signal.throwIfAborted();
+    // Source passages are available for the next context-building step.
     const messages = buildContext({ ...query, message: query.question });
     generating = true;
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -79,6 +93,8 @@ export async function POST(request: Request): Promise<Response> {
         "Cache-Control": "no-store, no-transform",
         "X-Accel-Buffering": "no",
         "X-RAG-Query-Status": queryVector ? "ready" : "unavailable",
+        "X-RAG-Search-Status": retrievedChunks === null ? "unavailable" : retrievedChunks.length ? "ready" : "empty",
+        "X-RAG-Retrieved-Chunks": String(retrievedChunks?.length ?? 0),
       },
     });
   } catch (error) {

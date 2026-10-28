@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { mock, test } from "node:test";
+import { QdrantClient } from "@qdrant/js-client-rest";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import ts from "typescript";
@@ -229,6 +230,12 @@ test("prior messages and responses are sent once and a streamed answer commits o
 test("the real chat API streams an answer and preserves conversation history without RAG", async (t) => {
   const { POST } = await import("../app/api/chat/route.ts");
   const originalKey = process.env.OPENROUTER_API_KEY;
+  const names = ["QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION"];
+  const originalQdrant = new Map(names.map((name) => [name, process.env[name]]));
+  process.env.QDRANT_URL = "https://unit.eu-central.aws.cloud.qdrant.io:6333";
+  process.env.QDRANT_API_KEY = "fake-qdrant-test-key";
+  process.env.QDRANT_COLLECTION = "unit_documents";
+  const database = mock.method(QdrantClient.prototype, "query", async () => ({ points: [] }));
   process.env.OPENROUTER_API_KEY = "test-only-key";
   const upstream = mock.method(globalThis, "fetch", async (url, options) => {
     if (url === "https://openrouter.ai/api/v1/embeddings") {
@@ -244,8 +251,13 @@ test("the real chat API streams an answer and preserves conversation history wit
   });
   t.after(() => {
     upstream.mock.restore();
+    database.mock.restore();
     if (originalKey === undefined) delete process.env.OPENROUTER_API_KEY;
     else process.env.OPENROUTER_API_KEY = originalKey;
+    for (const [name, value] of originalQdrant) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   });
   const app = mountChat({ saved: savedConversation([completeTurn("first")]) });
   await flush();
@@ -260,6 +272,7 @@ test("the real chat API streams an answer and preserves conversation history wit
   assert.equal(app.saved.turns[1].status, "complete");
   assert.equal(app.saved.turns[1].assistant.content, "Blue");
   assert.equal(upstream.mock.callCount(), 2);
+  assert.equal(database.mock.callCount(), 1);
   app.unmount();
 });
 

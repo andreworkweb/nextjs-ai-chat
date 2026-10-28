@@ -198,8 +198,9 @@ Valid requests return **200** with a streamed `text/event-stream` response from
 the existing OpenRouter chat model. The server reads `OPENROUTER_API_KEY` from
 private environment configuration and uses the existing bounded conversation
 context, output token limit, and cancellation handling. The chat interface shows
-the streamed answer and saves completed turns. Step 8 adds query embedding
-preparation before generation; document search remains a later stage.
+the streamed answer and saves completed turns. Steps 8 and 9 prepare a query
+embedding and retrieve matching source chunks before generation. Assembling
+those passages into the answer prompt remains a later stage.
 
 Error responses use JSON and `Cache-Control: no-store`; successful streams use
 `no-store, no-transform`. Invalid JSON or questions
@@ -230,7 +231,7 @@ Run API validation, provider-error, and client streaming tests with Node.js 24:
 node --test tests/chat-api.test.mjs tests/use-chat.test.mjs
 ```
 
-Document retrieval remains a later stage. Ordinary chat requires a valid
+Building answer prompts from the retrieved passages remains a later stage. Chat requires a valid
 `OPENROUTER_API_KEY`, while validation tests use mocked HTTP and fake credentials.
 
 ## Query embedding generation (Step 8)
@@ -255,7 +256,8 @@ The chat route now validates the request, embeds only the current question, and
 then streams the existing chat response. The vector stays on the server; it is
 not included in the response, logs, or chat model prompt. Request cancellation
 stops embedding and prevents chat generation. The existing overall request
-deadline covers both stages. No Qdrant search or storage runs in this endpoint.
+deadline covers the pipeline stages. Step 9 now uses the vector for read-only
+Qdrant search, described below.
 
 Ordinary chat remains available if the embedding stage reports a provider or
 configuration error after its shared retry policy. A successful chat response
@@ -273,3 +275,75 @@ To check the deployed backend locally, run `npm run dev` and send a valid
 `POST /api/chat` request as shown above. With the existing server environment
 configured, expect HTTP 200, a streamed answer, and the `ready` header. No new
 environment variables or browser-accessible credentials are needed.
+
+## Semantic vector search (Step 9)
+
+`searchVectors(queryEmbedding, options?)` in `src/lib/rag/search-vectors.ts`
+uses the existing Step 6 cloud client and Qdrant's current
+[`query()` API](https://api.qdrant.tech/api-reference/search/query-points).
+It searches the existing collection without creating collections or writing data.
+Only the required source payload fields are requested, with stored vectors omitted.
+
+The default result limit is 10. Set server-side `RAG_SEARCH_LIMIT` or pass
+`limit` to select 1–100 results. An optional `minScore` or server-side
+`RAG_SEARCH_MIN_SCORE` sets the minimum Cosine similarity from -1 to 1.
+There is no threshold by default, and explicit options override environment
+defaults. Scores are returned in descending order.
+
+Each strongly typed `VectorSearchResult` contains `text`, `sourceName`,
+`documentId`, original `chunkId`, `chunkIndex`, `score`, and the one-based physical
+`page`. The same page is retained as `pageNumber` for compatibility with
+`ParsedPage`. The original chunk ID comes from payload `id`, rather than the
+separate Qdrant point ID scoped by source name.
+
+Use metadata restrictions from trusted backend code:
+
+```typescript
+const vector = await embedQuery(question);
+const chunks = await searchVectors(vector, {
+  limit: 10,
+  filter: { documentIds: authorizedDocumentIds, sourceNames: selectedSourceNames },
+});
+```
+
+`documentIds` and `sourceNames` are exact-match allowlists combined with AND;
+within each list, any value can match. An empty list returns `[]` without a
+database request. The filter uses Qdrant
+[`match.any` conditions](https://qdrant.tech/documentation/search/filtering/)
+on the payload indexes already created during ingestion. Invalid filter fields
+are rejected, and returned passages outside the requested scope are rejected.
+These filters support access restrictions; authentication and authorization must
+derive the allowed scope on the server. Browser-supplied filter fields are not
+forwarded by `/api/chat`. The current portfolio sample collection is public.
+
+An empty collection, unmatched filter, or unmatched score threshold returns `[]`.
+Missing collections, database failures, invalid vectors, and malformed source
+metadata produce safe `QdrantStorageError` errors. Search validates finite,
+non-zero vectors against the existing ingestion dimensions. Cancellation stops
+awaiting search promptly; the SDK retains its existing bounded network timeout.
+
+The backend pipeline now runs validation → query embedding → vector search →
+ordinary chat generation. Retrieved passages remain server-side for the next
+context-building step; they are not yet sent to the chat model or browser.
+`X-RAG-Search-Status` is `ready`, `empty`, or `unavailable`, and
+`X-RAG-Retrieved-Chunks` reports the count. Ordinary chat remains available if
+embedding or search is unavailable, as requested. These status headers describe
+retrieval preparation, not whether the answer is grounded in the documents.
+
+Run isolated tests, including indexing and searching the Step 1 sample PDF:
+
+```powershell
+node --test tests/search-vectors.test.mjs tests/chat-api.test.mjs
+```
+
+After `npm run ingest`, run the separate read-only cloud integration test:
+
+```powershell
+$env:RUN_VECTOR_SEARCH_INTEGRATION = "1"
+node --env-file=.env.local --test tests/search-vectors.integration.test.mjs
+Remove-Item Env:RUN_VECTOR_SEARCH_INTEGRATION
+```
+
+The live test embeds two Step 1 fixture questions, checks expected source pages
+among the top 10 hits, verifies filters and thresholds, and checks empty results.
+It neither updates the index nor generates answers.

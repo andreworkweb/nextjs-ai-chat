@@ -5,7 +5,9 @@ export function fakeQdrant({ dimensions = 3, exists = true, distance = "Cosine" 
   const info = { config: { params: { vectors: { size: dimensions, distance } } }, payload_schema: {} };
   const record = (method, args) => calls.push({ method, args: structuredClone(args) });
   const matches = (point, filter = {}) => {
-    const match = (condition) => point.payload[condition.key] === condition.match.value;
+    const match = (condition) => condition.match.any
+      ? condition.match.any.includes(point.payload[condition.key])
+      : point.payload[condition.key] === condition.match.value;
     return (filter.must ?? []).every(match) && !(filter.must_not ?? []).some(match);
   };
   const client = {
@@ -48,6 +50,21 @@ export function fakeQdrant({ dimensions = 3, exists = true, distance = "Cosine" 
     async count(...args) {
       record("count", args);
       return { count: [...points.values()].filter((point) => matches(point, args[1].filter)).length };
+    },
+    async query(...args) {
+      record("query", args);
+      if (!exists) throw Object.assign(new Error("Missing"), { status: 404 });
+      const request = args[1];
+      const norm = Math.hypot(...request.query);
+      const hits = [...points.values()].filter((point) => matches(point, request.filter))
+        .map((point) => {
+          const pointNorm = Math.hypot(...point.vector);
+          const dot = point.vector.reduce((sum, value, index) => sum + value * request.query[index], 0);
+          return { id: point.id, score: norm && pointNorm ? dot / norm / pointNorm : 0, payload: structuredClone(point.payload) };
+        })
+        .filter((point) => request.score_threshold === undefined || point.score >= request.score_threshold)
+        .sort((left, right) => right.score - left.score).slice(0, request.limit);
+      return { points: hits };
     },
   };
   return { client, points, calls, info, connection: { client, collection: "unit_documents", dimensions } };
