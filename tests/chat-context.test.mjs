@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { afterEach, mock, test } from "node:test";
+import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
@@ -22,7 +22,7 @@ function loadTypeScript(relativePath) {
   modules.set(file, loaded);
   const localRequire = (id) =>
     id.startsWith(".")
-      ? loadTypeScript(path.relative(path.resolve(testDir, ".."), path.resolve(path.dirname(file), `${id}.ts`)))
+      ? loadTypeScript(path.relative(path.resolve(testDir, ".."), path.resolve(path.dirname(file), id.endsWith(".ts") ? id : `${id}.ts`)))
       : nodeRequire(id);
   new Function("module", "exports", "require", compiled.outputText)(loaded, loaded.exports, localRequire);
   return loaded.exports;
@@ -31,13 +31,11 @@ function loadTypeScript(relativePath) {
 const {
   buildContext,
   ChatContextError,
-  MAX_COMPLETION_TOKENS,
   MAX_REQUEST_BYTES,
   parseChatRequest,
   readChatRequest,
 } = loadTypeScript("app/lib/chat-context/context.ts");
 const { MAX_HISTORY_MESSAGES, MAX_MESSAGE_BYTES } = loadTypeScript("app/lib/chat-context/types.ts");
-const { POST } = loadTypeScript("app/api/chat/route.ts");
 
 function pair(id, user = "Remember blue", assistant = "I will remember blue") {
   return [
@@ -57,13 +55,6 @@ function request(body, options = {}) {
 function expectContextError(run, status) {
   assert.throws(run, (error) => error instanceof ChatContextError && error.status === status);
 }
-
-const originalKey = process.env.OPENROUTER_API_KEY;
-afterEach(() => {
-  mock.restoreAll();
-  if (originalKey === undefined) delete process.env.OPENROUTER_API_KEY;
-  else process.env.OPENROUTER_API_KEY = originalKey;
-});
 
 test("legacy requests still send the original user message", () => {
   assert.deepEqual(buildContext(parseChatRequest({ message: " Hello " })), [
@@ -166,67 +157,4 @@ test("request size is enforced even without a Content-Length header", async () =
   await assert.rejects(readChatRequest(request("{}", {
     headers: { "Content-Length": String(MAX_REQUEST_BYTES + 1) },
   })), (error) => error instanceof ChatContextError && error.status === 413);
-});
-
-test("malformed JSON is a controlled 400 response before contacting the provider", async () => {
-  const upstream = mock.method(globalThis, "fetch", async () => { throw new Error("Unexpected fetch"); });
-  const response = await POST(request("{invalid"));
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /valid JSON/);
-  assert.equal(upstream.mock.callCount(), 0);
-});
-
-test("a missing server API key returns a safe configuration error", async () => {
-  delete process.env.OPENROUTER_API_KEY;
-  const response = await POST(request({ message: "Hi" }));
-  assert.equal(response.status, 503);
-  assert.deepEqual(await response.json(), { error: "The AI service is not configured" });
-});
-
-test("the API retains fetch streaming, bounded context, output reserve, and cancellation", async () => {
-  process.env.OPENROUTER_API_KEY = "test-only-key";
-  const clientAbort = new AbortController();
-  let upstreamSignal;
-  let upstreamBody;
-  mock.method(globalThis, "fetch", async (url, options) => {
-    assert.equal(url, "https://openrouter.ai/api/v1/chat/completions");
-    assert.equal(options.cache, "no-store");
-    upstreamSignal = options.signal;
-    upstreamBody = JSON.parse(options.body);
-    return new Response("data: [DONE]\n\n");
-  });
-  const response = await POST(request({ message: "Which color?", history: pair("first") }, {
-    signal: clientAbort.signal,
-  }));
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("Content-Type"), /text\/event-stream/);
-  assert.equal(upstreamBody.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
-  assert.equal(upstreamBody.max_completion_tokens, MAX_COMPLETION_TOKENS);
-  assert.equal(upstreamBody.messages.length, 3);
-  assert.equal(await response.text(), "data: [DONE]\n\n");
-  clientAbort.abort();
-  assert.equal(upstreamSignal.aborted, true);
-});
-
-test("provider failures remain safe and do not reveal provider details", async () => {
-  process.env.OPENROUTER_API_KEY = "test-only-key";
-  for (const [upstreamStatus, expected] of [[429, 429], [400, 400], [413, 400], [401, 502], [500, 502]]) {
-    mock.method(globalThis, "fetch", async () => new Response("private provider details", { status: upstreamStatus }));
-    const response = await POST(request({ message: "Hi" }));
-    assert.equal(response.status, expected);
-    assert.doesNotMatch(await response.text(), /private provider details|test-only-key/);
-    mock.restoreAll();
-  }
-});
-
-test("network failures, timeouts, and client cancellation have controlled responses", async () => {
-  process.env.OPENROUTER_API_KEY = "test-only-key";
-  mock.method(globalThis, "fetch", async () => { throw new TypeError("private network details"); });
-  assert.equal((await POST(request({ message: "Hi" }))).status, 502);
-  mock.restoreAll();
-  mock.method(globalThis, "fetch", async () => { throw new DOMException("Timed out", "TimeoutError"); });
-  assert.equal((await POST(request({ message: "Hi" }))).status, 504);
-  const cancelled = new AbortController();
-  cancelled.abort();
-  assert.equal((await POST(request({ message: "Hi" }, { signal: cancelled.signal }))).status, 499);
 });

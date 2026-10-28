@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import ts from "typescript";
@@ -209,6 +209,7 @@ test("prior messages and responses are sent once and a streamed answer commits o
   await flush();
   const payload = JSON.parse(app.fetchCalls[0][1].body);
   assert.equal(payload.message, "Which color?");
+  assert.equal(payload.question, "Which color?");
   assert.deepEqual(payload.history, [completeTurn("first").user, completeTurn("first").assistant]);
   assert.equal(app.saved.turns.length, 2);
   assert.equal(app.saved.turns[1].status, "pending");
@@ -222,6 +223,39 @@ test("prior messages and responses are sent once and a streamed answer commits o
   assert.equal(app.saved.turns[1].status, "complete");
   assert.equal(app.saved.turns[1].assistant.content, "Blue");
   assert.equal(app.state.loading, false);
+  app.unmount();
+});
+
+test("the real chat API streams an answer and preserves conversation history without RAG", async (t) => {
+  const { POST } = await import("../app/api/chat/route.ts");
+  const originalKey = process.env.OPENROUTER_API_KEY;
+  process.env.OPENROUTER_API_KEY = "test-only-key";
+  const upstream = mock.method(globalThis, "fetch", async (_url, options) => {
+    assert.deepEqual(JSON.parse(options.body).messages, [
+      { role: "user", content: "Remember blue" },
+      { role: "assistant", content: "I remember blue" },
+      { role: "user", content: "Which color?" },
+    ]);
+    return finishedResponse("Blue");
+  });
+  t.after(() => {
+    upstream.mock.restore();
+    if (originalKey === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = originalKey;
+  });
+  const app = mountChat({ saved: savedConversation([completeTurn("first")]) });
+  await flush();
+  app.setFetch((url, init) => POST(new Request(`http://localhost${url}`, init)));
+  await app.type("Which color?");
+  await app.state.askAI();
+  await flush();
+  assert.equal(app.state.error, "");
+  assert.equal(app.state.loading, false);
+  assert.equal(app.state.reply, "Blue");
+  assert.equal(app.saved.turns[0].status, "complete");
+  assert.equal(app.saved.turns[1].status, "complete");
+  assert.equal(app.saved.turns[1].assistant.content, "Blue");
+  assert.equal(upstream.mock.callCount(), 1);
   app.unmount();
 });
 

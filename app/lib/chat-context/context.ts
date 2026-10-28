@@ -3,7 +3,7 @@ import {
   MAX_HISTORY_BYTES,
   MAX_HISTORY_MESSAGES,
   MAX_MESSAGE_BYTES,
-} from "./types";
+} from "./types.ts";
 
 export const MAX_REQUEST_BYTES = 512 * 1024;
 export const MAX_COMPLETION_TOKENS = 8192;

@@ -174,3 +174,62 @@ needed, and a write-capable key locally for ingestion. Do not use a
 The website reads the pre-indexed cloud collection after deployment; visitors do
 not need to install software or run ingestion themselves. This step does not
 change OpenRouter, embedding model settings, or the existing chat endpoint.
+
+## RAG question API (Step 7)
+
+`POST /api/chat` accepts a JSON object with a `question` string. Send
+`Content-Type: application/json`. [Zod](https://zod.dev/basics) validates the
+request and provides the inferred `ChatQueryRequest` TypeScript type in
+`src/lib/rag/chat-request.ts`. Leading and trailing whitespace is trimmed;
+questions must contain 1–4000 Unicode code points after trimming. Internal
+whitespace, punctuation, numbers, URLs, and technical terms are preserved.
+Optional `history`, `messageId`, and `conversationId` fields use the existing
+conversation validation. Unrelated fields, including client-supplied provider
+settings, are discarded.
+
+The handler lives in `src/app/api/chat/route.ts`. Since this project uses a root
+`app/` directory, `app/api/chat/route.ts` forwards to that handler. The existing
+`cacheComponents: true` configuration requires Node.js; this installed Next.js
+version rejects explicit route-level `runtime` exports with that setting.
+The existing chat client also sends `question` while
+preserving its conversation metadata and local history.
+
+Valid requests return **200** with a streamed `text/event-stream` response from
+the existing OpenRouter chat model. The server reads `OPENROUTER_API_KEY` from
+private environment configuration and uses the existing bounded conversation
+context, output token limit, and cancellation handling. The chat interface shows
+the streamed answer and saves completed turns. Ordinary chat works while RAG
+retrieval is being developed; this endpoint does not embed questions or search
+the document collection yet.
+
+Error responses use JSON and `Cache-Control: no-store`; successful streams use
+`no-store, no-transform`. Invalid JSON or questions
+return **400**; bodies above 512 KiB return **413**, even without an accurate
+`Content-Length`; missing or non-JSON content types return **415**. Validation
+errors include `details` with field names and messages. Unexpected failures
+return a sanitized **500** error, and cancelled requests return **499**.
+Missing server credentials return **503**, provider rate limits return **429**,
+provider or network failures return **502**, and generation timeouts return
+**504**. Upstream error bodies and private exception messages are not exposed.
+Next.js returns **405** for unsupported methods.
+
+To verify, run `npm run dev`, then in another PowerShell terminal:
+
+```powershell
+$body = @{ question = "Hello!" } | ConvertTo-Json
+Invoke-WebRequest http://localhost:3000/api/chat -Method Post `
+  -ContentType application/json -Body $body -SkipHttpErrorCheck
+```
+
+Expect status 200 and a stream of answer events. Sending `{ "question": " " }` should
+return 400 with `code: "INVALID_REQUEST"` and a question validation detail.
+`-SkipHttpErrorCheck` requires PowerShell 7.
+
+Run API validation, provider-error, and client streaming tests with Node.js 24:
+
+```powershell
+node --test tests/chat-api.test.mjs tests/use-chat.test.mjs
+```
+
+Document retrieval remains a later stage. Ordinary chat requires a valid
+`OPENROUTER_API_KEY`, while validation tests use mocked HTTP and fake credentials.
