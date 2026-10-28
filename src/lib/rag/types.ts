@@ -15,3 +15,8 @@ export interface Chunk extends ParsedPage {
   /** Zero-based position within this page; order by pageNumber, then chunkIndex. */
   chunkIndex: number;
 }
+
+/** A chunk and its validated embedding, ready for vector storage. */
+export interface EmbeddedChunk extends Chunk {
+  embedding: number[];
+}
