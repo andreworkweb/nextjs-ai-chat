@@ -230,7 +230,11 @@ test("the real chat API streams an answer and preserves conversation history wit
   const { POST } = await import("../app/api/chat/route.ts");
   const originalKey = process.env.OPENROUTER_API_KEY;
   process.env.OPENROUTER_API_KEY = "test-only-key";
-  const upstream = mock.method(globalThis, "fetch", async (_url, options) => {
+  const upstream = mock.method(globalThis, "fetch", async (url, options) => {
+    if (url === "https://openrouter.ai/api/v1/embeddings") {
+      assert.deepEqual(JSON.parse(options.body).input, ["Which color?"]);
+      return Response.json({ data: [{ index: 0, embedding: Array(1024).fill(0.25) }] });
+    }
     assert.deepEqual(JSON.parse(options.body).messages, [
       { role: "user", content: "Remember blue" },
       { role: "assistant", content: "I remember blue" },
@@ -255,7 +259,7 @@ test("the real chat API streams an answer and preserves conversation history wit
   assert.equal(app.saved.turns[0].status, "complete");
   assert.equal(app.saved.turns[1].status, "complete");
   assert.equal(app.saved.turns[1].assistant.content, "Blue");
-  assert.equal(upstream.mock.callCount(), 1);
+  assert.equal(upstream.mock.callCount(), 2);
   app.unmount();
 });
 

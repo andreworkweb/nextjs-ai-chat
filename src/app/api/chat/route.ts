@@ -1,5 +1,7 @@
 import { ChatQueryError, readChatQuery } from "../../../lib/rag/chat-request.ts";
 import { buildContext, MAX_COMPLETION_TOKENS } from "../../../../app/lib/chat-context/context.ts";
+import { embedQuery } from "../../../lib/rag/embed-query.ts";
+import { EmbeddingGenerationError } from "../../../lib/rag/generate-embeddings.ts";
 
 // next.config.ts enables cacheComponents, which requires the Node.js runtime.
 // This Next.js version rejects route-level runtime exports with that setting.
@@ -21,11 +23,21 @@ export async function POST(request: Request): Promise<Response> {
       return errorResponse("The AI service is not configured", "AI_NOT_CONFIGURED", 503);
     }
 
-    const messages = buildContext({ ...query, message: query.question });
     const signal = AbortSignal.any([
       request.signal,
       AbortSignal.timeout(GENERATION_TIMEOUT_MS),
     ]);
+    // This vector is the input for the next retrieval stage; keep it server-side.
+    let queryVector: number[] | null = null;
+    try {
+      queryVector = await embedQuery(query.question, { signal });
+    } catch (error) {
+      signal.throwIfAborted();
+      // Keep ordinary chat available while the retrieval stage is being built.
+      if (!(error instanceof EmbeddingGenerationError)) throw error;
+    }
+    signal.throwIfAborted();
+    const messages = buildContext({ ...query, message: query.question });
     generating = true;
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
@@ -66,6 +78,7 @@ export async function POST(request: Request): Promise<Response> {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-store, no-transform",
         "X-Accel-Buffering": "no",
+        "X-RAG-Query-Status": queryVector ? "ready" : "unavailable",
       },
     });
   } catch (error) {

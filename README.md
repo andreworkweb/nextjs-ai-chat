@@ -198,9 +198,8 @@ Valid requests return **200** with a streamed `text/event-stream` response from
 the existing OpenRouter chat model. The server reads `OPENROUTER_API_KEY` from
 private environment configuration and uses the existing bounded conversation
 context, output token limit, and cancellation handling. The chat interface shows
-the streamed answer and saves completed turns. Ordinary chat works while RAG
-retrieval is being developed; this endpoint does not embed questions or search
-the document collection yet.
+the streamed answer and saves completed turns. Step 8 adds query embedding
+preparation before generation; document search remains a later stage.
 
 Error responses use JSON and `Cache-Control: no-store`; successful streams use
 `no-store, no-transform`. Invalid JSON or questions
@@ -233,3 +232,44 @@ node --test tests/chat-api.test.mjs tests/use-chat.test.mjs
 
 Document retrieval remains a later stage. Ordinary chat requires a valid
 `OPENROUTER_API_KEY`, while validation tests use mocked HTTP and fake credentials.
+
+## Query embedding generation (Step 8)
+
+Call `embedQuery(question, options?)` from `src/lib/rag/embed-query.ts` on the
+Node.js backend. It returns one validated `number[]` that can be passed directly
+to the next Qdrant retrieval stage. Empty and non-string questions are rejected.
+The helper embeds the complete question once, preserving its text without
+splitting or truncation. The provider's input token limit still applies.
+
+Both `generateEmbeddings(chunks)` and `embedQuery(question)` use `embedTexts`
+from the existing Step 5 module. There is one model, credential, and dimensions
+configuration: the existing `OPENROUTER_API_KEY` and `RAG_EMBEDDING_*` variables.
+The defaults remain `liquid/lfm-2.5-embedding-350m:free` with 1024 dimensions.
+Timeouts, bounded exponential retries, rate-limit handling, finite-number
+validation, and safe `EmbeddingGenerationError` errors are shared. The same
+optional `fetch`, `sleep`, and `signal` transports support isolated tests.
+Keep the shared configuration consistent with ingestion; if it changes, reindex
+documents before comparing their vectors with query embeddings.
+
+The chat route now validates the request, embeds only the current question, and
+then streams the existing chat response. The vector stays on the server; it is
+not included in the response, logs, or chat model prompt. Request cancellation
+stops embedding and prevents chat generation. The existing overall request
+deadline covers both stages. No Qdrant search or storage runs in this endpoint.
+
+Ordinary chat remains available if the embedding stage reports a provider or
+configuration error after its shared retry policy. A successful chat response
+includes `X-RAG-Query-Status: ready` when the vector was prepared, or `unavailable`
+when chat continued without it. This status describes query embedding only;
+answers are still ordinary chat until document retrieval is connected.
+
+Run the mocked unit and backend integration tests with Node.js 24:
+
+```powershell
+node --test tests/embed-query.test.mjs tests/generate-embeddings.test.mjs tests/chat-api.test.mjs
+```
+
+To check the deployed backend locally, run `npm run dev` and send a valid
+`POST /api/chat` request as shown above. With the existing server environment
+configured, expect HTTP 200, a streamed answer, and the `ready` header. No new
+environment variables or browser-accessible credentials are needed.

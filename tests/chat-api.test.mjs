@@ -9,7 +9,18 @@ import {
 } from "../src/lib/rag/chat-request.ts";
 
 const originalKey = process.env.OPENROUTER_API_KEY;
+const embeddingSettings = ["RAG_EMBEDDING_MODEL", "RAG_EMBEDDING_DIMENSIONS", "RAG_EMBEDDING_BATCH_SIZE", "RAG_EMBEDDING_TIMEOUT_MS", "RAG_EMBEDDING_MAX_RETRIES"];
+const originalEmbeddingSettings = new Map(embeddingSettings.map((name) => [name, process.env[name]]));
 const streamText = 'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\ndata: [DONE]\n\n';
+
+function embeddingResponse() {
+  return Response.json({ data: [{ index: 0, embedding: Array(1024).fill(0.25) }] });
+}
+
+function mockChatFetch(implementation) {
+  return mock.method(globalThis, "fetch", (url, options) => url === "https://openrouter.ai/api/v1/embeddings"
+    ? embeddingResponse() : implementation(url, options));
+}
 
 function request(body, options = {}) {
   return new Request("http://localhost/api/chat", {
@@ -22,13 +33,19 @@ function request(body, options = {}) {
 
 beforeEach(() => {
   process.env.OPENROUTER_API_KEY = "test-only-key";
-  mock.method(globalThis, "fetch", async () => new Response(streamText));
+  for (const name of embeddingSettings) delete process.env[name];
+  process.env.RAG_EMBEDDING_MAX_RETRIES = "0";
+  mockChatFetch(async () => new Response(streamText));
 });
 
 afterEach(() => {
   mock.restoreAll();
   if (originalKey === undefined) delete process.env.OPENROUTER_API_KEY;
   else process.env.OPENROUTER_API_KEY = originalKey;
+  for (const [name, value] of originalEmbeddingSettings) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
 });
 
 async function expectError(req, status, code) {
@@ -48,11 +65,12 @@ test("the active Next.js route forwards the question handler", async () => {
   const response = await activePOST(request({ question: "How does TaskFlow work?" }));
   assert.equal(response.status, 200);
   assert.match(response.headers.get("Content-Type"), /text\/event-stream/);
+  assert.equal(response.headers.get("X-RAG-Query-Status"), "ready");
   assert.equal(await response.text(), streamText);
 });
 
 test("a valid question streams a real provider response using server-owned settings", async () => {
-  const upstream = mock.method(globalThis, "fetch", async (url, options) => {
+  const upstream = mockChatFetch(async (url, options) => {
     assert.equal(url, "https://openrouter.ai/api/v1/chat/completions");
     assert.equal(options.headers.Authorization, "Bearer test-only-key");
     assert.equal(options.cache, "no-store");
@@ -71,7 +89,7 @@ test("a valid question streams a real provider response using server-owned setti
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("Cache-Control"), "no-store, no-transform");
   assert.equal(await response.text(), streamText);
-  assert.equal(upstream.mock.callCount(), 1);
+  assert.equal(upstream.mock.callCount(), 2);
 });
 
 test("typed parsing trims outer whitespace and preserves meaningful question content", async () => {
@@ -229,7 +247,7 @@ test("a missing server API key returns a clear error without a provider call", a
 test("prior conversation turns reach the provider once and client cancellation is forwarded", async () => {
   const controller = new AbortController();
   let upstreamSignal;
-  mock.method(globalThis, "fetch", async (_url, options) => {
+  mockChatFetch(async (_url, options) => {
     upstreamSignal = options.signal;
     assert.deepEqual(JSON.parse(options.body).messages, [
       { role: "user", content: "Remember blue" },
@@ -274,7 +292,7 @@ test("provider errors are mapped to safe HTTP errors and their bodies are releas
       start(controller) { controller.enqueue(new TextEncoder().encode("private provider details test-only-key")); },
       cancel() { cancelled = true; },
     });
-    mock.method(globalThis, "fetch", async () => new Response(body, { status }));
+    mockChatFetch(async () => new Response(body, { status }));
     const payload = await expectError(request({ question: "Hi" }), expected, code);
     assert.doesNotMatch(JSON.stringify(payload), /private provider details|test-only-key/);
     assert.equal(cancelled, true);
@@ -282,14 +300,73 @@ test("provider errors are mapped to safe HTTP errors and their bodies are releas
 });
 
 test("network failures and timeouts return sanitized structured errors", async () => {
-  mock.method(globalThis, "fetch", async () => { throw new TypeError("private network details test-only-key"); });
+  mockChatFetch(async () => { throw new TypeError("private network details test-only-key"); });
   const network = await expectError(request({ question: "Hi" }), 502, "AI_UNAVAILABLE");
   assert.doesNotMatch(JSON.stringify(network), /private network details|test-only-key/);
-  mock.method(globalThis, "fetch", async () => { throw new DOMException("private timeout", "TimeoutError"); });
+  mockChatFetch(async () => { throw new DOMException("private timeout", "TimeoutError"); });
   await expectError(request({ question: "Hi" }), 504, "AI_TIMEOUT");
 });
 
 test("an upstream response without a body is rejected", async () => {
-  mock.method(globalThis, "fetch", async () => new Response(null));
+  mockChatFetch(async () => new Response(null));
   await expectError(request({ question: "Hi" }), 502, "AI_EMPTY_RESPONSE");
+});
+
+test("the backend embeds only the current question before generating a chat response", async () => {
+  const stages = [];
+  mock.method(globalThis, "fetch", async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === "https://openrouter.ai/api/v1/embeddings") {
+      stages.push("embed");
+      assert.deepEqual(body.input, ["Which color?"]);
+      assert.equal(body.model, "liquid/lfm-2.5-embedding-350m:free");
+      return embeddingResponse();
+    }
+    stages.push("chat");
+    assert.equal(body.messages.length, 3);
+    assert.equal(body.queryVector, undefined);
+    return new Response(streamText);
+  });
+  const response = await POST(request({
+    question: "Which color?",
+    history: [
+      { id: "first:user", role: "user", content: "Remember blue" },
+      { id: "first:assistant", role: "assistant", content: "I remember blue" },
+    ],
+  }));
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("X-RAG-Query-Status"), "ready");
+  assert.equal(await response.text(), streamText);
+  assert.deepEqual(stages, ["embed", "chat"]);
+});
+
+test("ordinary chat remains available when query embedding fails safely", async () => {
+  for (const failure of [
+    () => new Response("private embedding details test-only-key", { status: 429 }),
+    () => new Response("private embedding details test-only-key", { status: 503 }),
+    () => Response.json({ data: [{ index: 0, embedding: [1, 2] }] }),
+    () => { throw new TypeError("private embedding transport details"); },
+  ]) {
+    mock.method(globalThis, "fetch", async (url) => url === "https://openrouter.ai/api/v1/embeddings"
+      ? failure() : new Response(streamText));
+    const response = await POST(request({ question: "Hi" }));
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("X-RAG-Query-Status"), "unavailable");
+    assert.equal(await response.text(), streamText);
+    assert.doesNotMatch(JSON.stringify([...response.headers]), /private embedding|test-only-key/);
+  }
+});
+
+test("cancelling query embedding does not start chat generation", async () => {
+  const controller = new AbortController();
+  const upstream = mock.method(globalThis, "fetch", async (url, options) => {
+    assert.equal(url, "https://openrouter.ai/api/v1/embeddings");
+    const pending = new Promise((_resolve, reject) => {
+      options.signal.addEventListener("abort", () => reject(new DOMException("private reason", "AbortError")), { once: true });
+    });
+    controller.abort();
+    return pending;
+  });
+  await expectError(request({ question: "Hi" }, { signal: controller.signal }), 499, "REQUEST_CANCELLED");
+  assert.equal(upstream.mock.callCount(), 1);
 });

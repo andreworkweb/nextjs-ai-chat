@@ -124,34 +124,29 @@ function retryable(error: EmbeddingGenerationError): boolean {
 
 /**
  * Node.js server only. Reads OPENROUTER_API_KEY and RAG_EMBEDDING_* settings at
- * call time. Embeds complete chunk text without truncating it or changing IDs.
+ * call time. Shared transport for complete document and query texts.
  * No storage, logging, model fallback, or partial results are performed here.
  */
-export async function generateEmbeddings(
-  chunks: readonly Chunk[],
+export async function embedTexts(
+  texts: readonly string[],
   options: GenerateEmbeddingsOptions = {},
-): Promise<EmbeddedChunk[]> {
+): Promise<number[][]> {
   if (typeof window !== "undefined") {
     throw new EmbeddingGenerationError("CONFIGURATION_ERROR", "Embedding generation is only available on the Node.js server.");
   }
-  if (!Array.isArray(chunks)) {
-    throw new EmbeddingGenerationError("INVALID_INPUT", "Expected an array of Chunk objects.");
+  if (!Array.isArray(texts)) {
+    throw new EmbeddingGenerationError("INVALID_INPUT", "Expected an array of non-empty text strings.");
   }
-  const input: readonly Chunk[] = chunks;
+  const input: readonly string[] = texts;
   if (!options || typeof options !== "object" || Array.isArray(options)
     || (options.fetch !== undefined && typeof options.fetch !== "function")
     || (options.sleep !== undefined && typeof options.sleep !== "function")
     || (options.signal !== undefined && !(options.signal instanceof AbortSignal))) {
     throw new EmbeddingGenerationError("INVALID_INPUT", "Invalid embedding transport options.");
   }
-  for (const [index, chunk] of input.entries()) {
-    if (!chunk || typeof chunk.id !== "string" || !chunk.id.trim()
-      || typeof chunk.documentId !== "string" || !chunk.documentId.trim()
-      || typeof chunk.sourceName !== "string" || !chunk.sourceName.trim()
-      || typeof chunk.text !== "string" || !chunk.text.trim()
-      || !Number.isSafeInteger(chunk.pageNumber) || chunk.pageNumber < 1
-      || !Number.isSafeInteger(chunk.chunkIndex) || chunk.chunkIndex < 0) {
-      throw new EmbeddingGenerationError("INVALID_INPUT", `Chunk at index ${index} requires non-empty text, IDs, sourceName, and valid page and chunk numbers.`);
+  for (const [index, text] of input.entries()) {
+    if (typeof text !== "string" || !text.trim()) {
+      throw new EmbeddingGenerationError("INVALID_INPUT", `Text at index ${index} must be a non-empty string.`);
     }
   }
   if (input.length === 0) return [];
@@ -172,8 +167,8 @@ export async function generateEmbeddings(
   const fetchImplementation = options.fetch ?? globalThis.fetch;
   const sleep = options.sleep ?? ((milliseconds: number, signal?: AbortSignal) => delay(milliseconds, undefined, { signal }));
 
-  async function embedBatch(batch: readonly Chunk[]): Promise<number[][]> {
-    const body = JSON.stringify({ model, input: batch.map((chunk) => chunk.text), encoding_format: "float" });
+  async function embedBatch(batch: readonly string[]): Promise<number[][]> {
+    const body = JSON.stringify({ model, input: batch, encoding_format: "float" });
     for (let attempt = 0; ; attempt++) {
       if (options.signal?.aborted) throw cancelled();
       const controller = new AbortController();
@@ -229,13 +224,35 @@ export async function generateEmbeddings(
     }
   }
 
-  const results: EmbeddedChunk[] = [];
+  const results: number[][] = [];
   for (let offset = 0; offset < input.length; offset += batchSize) {
     const batch = input.slice(offset, offset + batchSize);
-    const vectors = await embedBatch(batch);
-    for (const [index, chunk] of batch.entries()) {
-      results.push({ ...chunk, embedding: vectors[index] });
-    }
+    results.push(...await embedBatch(batch));
   }
   return results;
+}
+
+/** Embed document chunks with the shared text transport, retaining all metadata. */
+export async function generateEmbeddings(
+  chunks: readonly Chunk[],
+  options: GenerateEmbeddingsOptions = {},
+): Promise<EmbeddedChunk[]> {
+  if (typeof window !== "undefined") {
+    throw new EmbeddingGenerationError("CONFIGURATION_ERROR", "Embedding generation is only available on the Node.js server.");
+  }
+  if (!Array.isArray(chunks)) {
+    throw new EmbeddingGenerationError("INVALID_INPUT", "Expected an array of Chunk objects.");
+  }
+  for (const [index, chunk] of chunks.entries()) {
+    if (!chunk || typeof chunk.id !== "string" || !chunk.id.trim()
+      || typeof chunk.documentId !== "string" || !chunk.documentId.trim()
+      || typeof chunk.sourceName !== "string" || !chunk.sourceName.trim()
+      || typeof chunk.text !== "string" || !chunk.text.trim()
+      || !Number.isSafeInteger(chunk.pageNumber) || chunk.pageNumber < 1
+      || !Number.isSafeInteger(chunk.chunkIndex) || chunk.chunkIndex < 0) {
+      throw new EmbeddingGenerationError("INVALID_INPUT", `Chunk at index ${index} requires non-empty text, IDs, sourceName, and valid page and chunk numbers.`);
+    }
+  }
+  const vectors = await embedTexts(chunks.map((chunk) => chunk.text), options);
+  return chunks.map((chunk, index) => ({ ...chunk, embedding: vectors[index] }));
 }
