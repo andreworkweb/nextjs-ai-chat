@@ -163,3 +163,25 @@ test("an explicit clear rotates the conversation and anchors a fallback owner id
   assert.deepEqual(cleared.turns, []);
   assert.deepEqual(loadConversation(initialOwner), cleared);
 });
+
+test("citations round-trip per assistant, while legacy messages remain compatible", () => {
+  const saved = conversation();
+  saved.turns[0].assistant.content = "Answer [S1].";
+  const citation = { label: "[S1]", documentId: "real-doc", chunkId: "real-chunk", sourceName: "Guide.pdf", pageNumber: 3 };
+  saved.turns[0].assistant.citations = [citation];
+  saved.turns.push(completeTurn("second"));
+  saveConversation(saved);
+  assert.deepEqual(loadConversation(saved.ownerId), saved);
+  assert.deepEqual(loadConversation(saved.ownerId).turns[0].assistant.citations, [citation]);
+  assert.equal(loadConversation(saved.ownerId).turns[1].assistant.citations, undefined);
+});
+
+test("bad optional citation data is discarded without losing saved conversation text", () => {
+  const saved = conversation();
+  saved.turns[0].assistant.content = "Answer [S1].";
+  saved.turns[0].assistant.citations = [{ label: "[S1]", documentId: "doc", chunkId: "chunk", sourceName: "Guide.pdf", pageNumber: 0 }];
+  const parsed = parseConversation(saved, saved.ownerId);
+  assert.equal(parsed.turns[0].assistant.content, "Answer [S1].");
+  assert.equal(parsed.turns[0].assistant.citations, undefined);
+  assert.equal(saved.turns[0].assistant.citations.length, 1);
+});

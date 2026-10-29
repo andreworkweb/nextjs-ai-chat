@@ -29,8 +29,8 @@ export async function POST(request: Request): Promise<Response> {
     signal.throwIfAborted();
     const prompt = buildPrompt(query.question, selectedChunks);
     const answer = await generateAnswer(prompt, { signal });
-    // answer.sources retains the exact citation map from this prompt for Step 13.
-    // Only answer text is serialized here; internal prompts and provider data stay private.
+    // Generation resolves cited labels against answer.sources before stream completion.
+    // Only answer text and verified display metadata are serialized; prompts stay private.
     return new Response(answer.stream, {
       headers: {
         "Content-Type": "text/event-stream; charset=utf-8",

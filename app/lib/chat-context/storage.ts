@@ -1,4 +1,5 @@
 import type { ChatMessage, ChatTurn, Conversation, TurnStatus } from "./types";
+import { resolveCitations } from "./citations.ts";
 
 const OWNER_STORAGE_KEY = "chat-context:owner:v1";
 const INVALID_HISTORY =
@@ -63,7 +64,8 @@ function parseMessage(
   ) {
     throw new Error(INVALID_HISTORY);
   }
-  return { id: value.id, role, content: value.content };
+  const citations = role === "assistant" ? resolveCitations(value.content, value.citations) : [];
+  return { id: value.id, role, content: value.content, ...(citations.length ? { citations } : {}) };
 }
 
 function isTurnStatus(value: unknown): value is TurnStatus {

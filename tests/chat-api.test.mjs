@@ -6,6 +6,7 @@ import { POST as activePOST } from "../app/api/chat/route.ts";
 import { buildPrompt } from "../src/lib/rag/build-prompt.ts";
 import { INSUFFICIENT_EVIDENCE } from "../src/lib/rag/generate-answer.ts";
 import { completionResponse } from "./helpers/openrouter-stream.mjs";
+import { readChatStream } from "../app/lib/read-chat-stream.ts";
 import {
   MAX_CHAT_REQUEST_BYTES,
   MAX_QUESTION_CHARACTERS,
@@ -542,6 +543,18 @@ test("prompt configuration errors stop generation without exposing internal deta
     assert.equal((await response.json()).code, "RAG_PROMPT_ERROR");
     assert.equal(upstream.mock.callCount(), 1);
   }
+});
+
+test("the endpoint resolves model markers against the exact Qdrant source mapping without additional requests", async () => {
+  mock.method(QdrantClient.prototype, "query", async () => retrievedPoints());
+  const upstream = mockChatFetch(async () => completionResponse("Supported answer [S5]. Unknown [S99]. Repeated [S5]."));
+  const response = await POST(request({ question: "Which passage supports the answer?" }));
+  let text = "";
+  const citations = await readChatStream(response.body, (content) => { text += content; });
+  assert.equal(text, "Supported answer [S5]. Unknown [S99]. Repeated [S5].");
+  assert.deepEqual(citations, [{ label: "[S5]", documentId: "original-document", chunkId: "original-chunk-4", sourceName: "guide.pdf", pageNumber: 5 }]);
+  assert.equal(upstream.mock.callCount(), 2);
+  assert.equal(QdrantClient.prototype.query.mock.callCount(), 1);
 });
 
 test("client cancellation during reranking prevents chat generation", async () => {

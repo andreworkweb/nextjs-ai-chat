@@ -4,6 +4,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { APICallError, streamText } from "ai";
 import { MAX_COMPLETION_TOKENS, estimateMessageTokens } from "../../../app/lib/chat-context/context.ts";
 import type { BuiltPrompt } from "./types.ts";
+import { resolveCitations } from "../../../app/lib/chat-context/citations.ts";
 
 export const INSUFFICIENT_EVIDENCE = "The supplied documents do not provide enough information to answer this question.";
 const DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
@@ -178,6 +179,7 @@ export async function generateAnswer(prompt: BuiltPrompt, options: GenerateAnswe
   // still use meaningful HTTP status codes before response headers are sent.
   const first = await iterator.next();
   if (first.done) throw new AnswerGenerationError("AI_EMPTY_RESPONSE", "The AI service returned no answer text.", 502);
+  let answerText = first.value;
   return {
     status: "grounded", sources,
     stream: new ReadableStream<Uint8Array>({
@@ -186,9 +188,14 @@ export async function generateAnswer(prompt: BuiltPrompt, options: GenerateAnswe
         try {
           const next = await iterator.next();
           if (next.done) {
+            const citations = resolveCitations(answerText, Object.entries(sources).map(([label, source]) => ({ ...source, label })));
+            if (citations.length) controller.enqueue(event({ type: "citations", citations }));
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
             controller.close();
-          } else controller.enqueue(textEvent(next.value));
+          } else {
+            answerText += next.value;
+            controller.enqueue(textEvent(next.value));
+          }
         } catch (error) {
           const safe = safeError(error, signal);
           controller.enqueue(event({ error: { message: safe.message, code: safe.code } }));

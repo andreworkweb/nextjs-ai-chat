@@ -483,11 +483,12 @@ Set these in Vercel's server environment and redeploy. Never use `NEXT_PUBLIC_`
 for credentials. Browser-supplied model, system prompt, or API key fields are ignored.
 
 The helper returns `{ stream, sources, status }`. `sources` is a snapshot of the
-Step 11 citation map retained server-side for Step 13; source presentation is not
-implemented here. `stream` uses the existing SSE content-delta and `[DONE]`
+Step 11 citation map retained server-side for Step 13 source verification.
+`stream` uses the existing SSE content-delta and `[DONE]`
 format, so the current chat interface and saved conversation UI continue to work.
-Only generated answer text is serialized; SDK reasoning, raw errors, provider
-metadata, prompts, and credentials are not forwarded or logged.
+Generated answer text and the verified Step 13 citation metadata are serialized;
+SDK reasoning, raw errors, provider metadata, prompts, and credentials are not
+forwarded or logged.
 
 If retrieval is empty, relevance filtering removes all hits, or no complete
 passage fits the prompt budget, a deterministic message states that the supplied
@@ -527,3 +528,45 @@ Remove-Item Env:RUN_ANSWER_INTEGRATION
 Production compilation was verified with `npm run build -- --webpack`. The
 default Turbopack build encountered a CSS worker startup crash in this Windows
 environment; the existing bundler configuration has not been changed by Step 12.
+
+## Verified citations in the existing chat (Step 13)
+
+The prompt builder assigns labels such as `[S5]` to the exact retrieved chunks
+included in the model context. After a successful answer finishes, generation
+matches its markers against that response's existing `sources` map. A `citations`
+SSE event is emitted immediately before the existing `[DONE]` marker. It contains
+only cited, valid labels with their real document ID, chunk ID, display filename,
+and one-based page number. Repeated labels are listed once; unknown labels never
+receive invented metadata. This verifies source identity, not the factual
+correctness of a model's interpretation.
+
+No model calls, database searches, or document reads are added for citations.
+Text deltas are delivered as before; source selection and serialization happen
+after the last answer text, so citation work does not delay the first token.
+Private path prefixes are removed for display. Citations are plain text, with
+no generated document URLs or public links to private files.
+
+The existing stream reader collects the optional metadata event, and `useChat`
+stores the verified citations on that specific completed assistant message.
+The existing chat component renders a small Sources list beneath that answer,
+for example `[S5] 03_API_Guide.pdf · Page 3`, using the existing styling. All
+filenames and answer text are escaped by React. Each answer retains its own map,
+so `[S1]` in two different turns can refer to different documents safely.
+
+Saved conversations retain citations across reloads under the existing storage
+schema. Older messages without metadata continue to render normally; their raw
+markers are not reconstructed into sources. Malformed optional citation data is
+discarded without losing the saved answer. Source metadata is not sent back as
+conversation context. Interrupted responses never commit partial citations;
+retry, reset, cancellation, and cross-tab behavior remain in the existing flow.
+
+Run mapping, UTF-8/SSE compatibility, rendering, persistence, and backend tests:
+
+```powershell
+node --test tests/citations.test.mjs tests/chat-ui.test.mjs tests/chat-storage.test.mjs tests/use-chat.test.mjs tests/generate-answer.test.mjs tests/chat-api.test.mjs
+```
+
+For a manual check, run `npm run dev` and ask about TaskFlow's API rate limit.
+After streaming completes, valid markers should have a Sources list showing
+the actual document name and page. Reload and send another question to verify
+that earlier source lists remain attached to their original answers.

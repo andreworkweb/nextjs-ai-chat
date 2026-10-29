@@ -36,6 +36,9 @@ function streamResponse() {
     content(text) {
       controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`));
     },
+    citations(citations) {
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "citations", citations })}\n\n`));
+    },
     done() { controller.enqueue(encoder.encode("data: [DONE]\n\n")); },
     interrupt() { controller.close(); },
   };
@@ -151,7 +154,7 @@ function mountChat({ saved, storageUnavailable = false, locks, storageEntries } 
     const localRequire = (id) => {
       if (id === "react") return react;
       if (!id.startsWith(".")) throw new Error(`Unexpected dependency: ${id}`);
-      return load(path.relative(project, path.resolve(path.dirname(file), `${id}.ts`)));
+      return load(path.relative(project, path.resolve(path.dirname(file), id.endsWith(".ts") ? id : `${id}.ts`)));
     };
     vm.runInContext(`(function(module, exports, require) { ${compiled.outputText}\n})`, context)(
       loaded, loaded.exports, localRequire,
@@ -277,6 +280,62 @@ test("the chat API streams grounded evidence and preserves stored conversation h
   assert.equal(app.saved.turns[1].assistant.content, "Blue");
   assert.equal(upstream.mock.callCount(), 2);
   assert.equal(database.mock.callCount(), 1);
+  app.unmount();
+});
+
+test("citations stay with their answer through streaming, reload, and the next request", async () => {
+  const first = completeTurn("first", "API?", "First [S1].");
+  const firstCitation = { label: "[S1]", documentId: "first-doc", chunkId: "first-chunk", sourceName: "API.pdf", pageNumber: 3 };
+  first.assistant.citations = [firstCitation];
+  const app = mountChat({ saved: savedConversation([first]) });
+  await flush();
+  const response = streamResponse();
+  app.setFetch(async () => response.response);
+  await app.type("Billing?");
+  const sending = app.state.askAI();
+  await flush();
+  const body = JSON.parse(app.fetchCalls[0][1].body);
+  assert.equal(body.history[1].citations, undefined);
+  const secondCitation = { label: "[S1]", documentId: "billing-doc", chunkId: "billing-chunk", sourceName: "Billing.pdf", pageNumber: 2 };
+  response.content("Second [S");
+  await flush();
+  assert.equal(app.state.reply, "Second [S");
+  assert.equal(app.saved.turns[1].assistant, undefined);
+  response.content("1]. Invalid [S99].");
+  response.citations([secondCitation, { ...secondCitation, label: "[S2]", sourceName: "Uncited.pdf" }]);
+  await flush();
+  assert.equal(app.saved.turns[1].status, "pending");
+  response.done();
+  await sending;
+  await flush();
+  assert.deepEqual(app.saved.turns[0].assistant.citations, [firstCitation]);
+  assert.deepEqual(app.saved.turns[1].assistant.citations, [secondCitation]);
+  const restored = mountChat({ storageEntries: app.snapshotStorage() });
+  await flush();
+  assert.deepEqual(plain(restored.state.conversation), app.saved);
+  app.unmount();
+  restored.unmount();
+});
+
+test("citation metadata from an interrupted response never enters saved history or a retry", async () => {
+  const app = mountChat();
+  await flush();
+  const response = streamResponse();
+  app.setFetch(async () => response.response);
+  await app.type("Question");
+  const sending = app.state.askAI();
+  await flush();
+  response.content("Partial [S1]");
+  response.citations([{ label: "[S1]", documentId: "doc", chunkId: "chunk", sourceName: "Guide.pdf", pageNumber: 1 }]);
+  response.interrupt();
+  await sending;
+  await flush();
+  assert.equal(app.saved.turns[0].status, "failed");
+  assert.equal(app.saved.turns[0].assistant, undefined);
+  app.setFetch(async () => finishedResponse("Retry without citations"));
+  await app.state.askAI();
+  await flush();
+  assert.equal(app.saved.turns[0].assistant.citations, undefined);
   app.unmount();
 });
 

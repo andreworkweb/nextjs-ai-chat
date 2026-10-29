@@ -145,12 +145,13 @@ test("streaming begins before completion and late provider failures become sanit
   let upstream;
   const body = new ReadableStream({ start(controller) {
     upstream = controller;
-    controller.enqueue(encoder.encode(completionEvent({ content: "Partial answer" })));
+    controller.enqueue(encoder.encode(completionEvent({ content: "Partial answer [S1]" })));
   } });
   const answer = await generateAnswer(prompt(), { fetch: async () => new Response(body, { headers: { "Content-Type": "text/event-stream" } }) });
   const reader = answer.stream.getReader();
   const first = new TextDecoder().decode((await reader.read()).value);
   assert.match(first, /Partial answer/);
+  assert.ok(!first.includes('"type":"citations"'));
   upstream.enqueue(encoder.encode('data: {"error":{"message":"private-body fake-private-key","code":500}}\n\n'));
   upstream.close();
   const rest = new TextDecoder().decode((await reader.read()).value);
@@ -201,4 +202,32 @@ test("already-aborted callers never start an LLM request", async () => {
   controller.abort();
   await assert.rejects(() => generateAnswer(prompt(), { signal: controller.signal }), { name: "AbortError" });
   assert.equal(globalThis.fetch.mock.callCount(), 0);
+});
+
+test("only cited prompt sources are emitted before DONE, without extra calls or private paths", async () => {
+  const input = prompt();
+  input.sources["[S1]"].sourceName = "A:\\private\\guide.pdf";
+  const evidence = JSON.parse(input.messages[1].content);
+  evidence.documentContext.sources[0].sourceName = input.sources["[S1]"].sourceName;
+  input.messages[1].content = JSON.stringify(evidence);
+  let calls = 0;
+  const answer = await generateAnswer(input, { fetch: async () => {
+    calls++;
+    return completionResponse("60 per minute [S1]. Repeated [S1]. Invalid [S99].");
+  } });
+  const wire = await new Response(answer.stream).text();
+  const events = wire.split("\n\n").filter(Boolean).map((line) => line.slice(6));
+  const metadata = events.filter((item) => item !== "[DONE]").map(JSON.parse).find((item) => item.type === "citations");
+  assert.deepEqual(metadata.citations, [{ label: "[S1]", documentId: "real-document", chunkId: "original-chunk", sourceName: "guide.pdf", pageNumber: 3 }]);
+  assert.equal(events.at(-1), "[DONE]");
+  assert.equal(JSON.parse(events.at(-2)).type, "citations");
+  assert.ok(!wire.includes("private") && !wire.includes("The API limit is") && !wire.includes("fake-private-key"));
+  assert.equal(calls, 1);
+});
+
+test("invalid citation labels produce no invented source metadata", async () => {
+  const answer = await generateAnswer(prompt(), { fetch: async () => completionResponse("No verified reference [S99].") });
+  const wire = await new Response(answer.stream).text();
+  assert.ok(!wire.includes('"type":"citations"'));
+  assert.ok(wire.includes("[S99]"));
 });
