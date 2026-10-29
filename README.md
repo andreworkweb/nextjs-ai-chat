@@ -199,8 +199,8 @@ the existing OpenRouter chat model. The server reads `OPENROUTER_API_KEY` from
 private environment configuration and uses the existing bounded conversation
 context, output token limit, and cancellation handling. The chat interface shows
 the streamed answer and saves completed turns. Steps 8 and 9 prepare a query
-embedding and retrieve matching source chunks before generation. Assembling
-those passages into the answer prompt remains a later stage.
+embedding and retrieve matching source chunks before generation. Step 11 builds
+a separate evidence prompt on the server; sending that prompt to the model is deferred.
 
 Error responses use JSON and `Cache-Control: no-store`; successful streams use
 `no-store, no-transform`. Invalid JSON or questions
@@ -231,7 +231,7 @@ Run API validation, provider-error, and client streaming tests with Node.js 24:
 node --test tests/chat-api.test.mjs tests/use-chat.test.mjs
 ```
 
-Building answer prompts from the retrieved passages remains a later stage. Chat requires a valid
+Using the prepared evidence prompt for generation remains a later stage. Chat requires a valid
 `OPENROUTER_API_KEY`, while validation tests use mocked HTTP and fake credentials.
 
 ## Query embedding generation (Step 8)
@@ -263,7 +263,7 @@ Ordinary chat remains available if the embedding stage reports a provider or
 configuration error after its shared retry policy. A successful chat response
 includes `X-RAG-Query-Status: ready` when the vector was prepared, or `unavailable`
 when chat continued without it. This status describes query embedding only;
-answers are still ordinary chat until document retrieval is connected.
+answers are still ordinary chat until the prepared evidence prompt is used for generation.
 
 Run the mocked unit and backend integration tests with Node.js 24:
 
@@ -323,8 +323,8 @@ non-zero vectors against the existing ingestion dimensions. Cancellation stops
 awaiting search promptly; the SDK retains its existing bounded network timeout.
 
 The backend pipeline now runs validation → query embedding → vector search →
-optional reranking → ordinary chat generation. Retrieved passages remain server-side for the next
-context-building step; they are not yet sent to the chat model or browser.
+optional reranking → prompt preparation → ordinary chat generation. Retrieved passages and
+the prepared evidence prompt remain server-side; they are not yet sent to the chat model or browser.
 `X-RAG-Search-Status` is `ready`, `empty`, or `unavailable`, and
 `X-RAG-Retrieved-Chunks` reports the count. Ordinary chat remains available if
 embedding or search is unavailable, as requested. These status headers describe
@@ -395,7 +395,7 @@ Provider response bodies, private exceptions, questions, and document passages
 are not logged.
 
 The backend calls reranking after successful vector search. Results stay on the
-server for later prompt construction. `X-RAG-Rerank-Status` is `ready` when real
+server for Step 11 prompt construction. `X-RAG-Rerank-Status` is `ready` when real
 model scores were applied, or `original` when vector-search order was retained.
 `X-RAG-Selected-Chunks` reports the post-reranking count, while
 `X-RAG-Retrieved-Chunks` retains the pre-reranking count.
@@ -409,3 +409,54 @@ node --test tests/rerank-chunks.test.mjs tests/chat-api.test.mjs
 The enabled-model path, metadata preservation, sorting, disabled behavior,
 fallbacks, and cancellation are covered with mock HTTP responses. No live Cohere
 call was made for Step 10; live model validation is deferred until a key is configured.
+
+## Context-aware prompt construction (Step 11)
+
+Call `buildPrompt(question, retrievedChunks, options?)` from
+`src/lib/rag/build-prompt.ts` on the server. It accepts vector-search results or
+complete reranked results and returns a typed `BuiltPrompt` with `messages`,
+`sources`, `estimatedTokens`, `tokenBudget`, and included/omitted chunk counts.
+It performs no network requests and does not call an LLM.
+
+The messages contain system instructions and a JSON user message containing the
+complete question and document evidence. Each included passage receives a unique
+label such as `[S1]`. `sources["[S1]"]` maps to the real `documentId`, `sourceName`,
+`chunkId`, `chunkIndex`, and one-based `pageNumber`/`page`. Original passage text
+and source identity are preserved. Labels are local to each constructed prompt.
+
+Instructions require answers supported only by the supplied evidence, citations
+using supplied labels, and an explicit admission when evidence is insufficient.
+Document text and filenames are untrusted JSON data, never system instructions.
+This separation and the instructions reduce prompt injection risk; they do not
+guarantee how a future model will behave. Empty retrieval produces an empty
+source map and an instruction to acknowledge insufficient evidence.
+
+The configurable budget covers **all** messages: instructions, complete question,
+JSON structure, source metadata, evidence, and message framing. Set private
+`RAG_CONTEXT_TOKEN_BUDGET` locally or in Vercel (default `8192`), or pass
+`{ tokenBudget: 4096 }` on the server. Valid budgets are integers from 1 to 131072.
+The builder reuses the existing conservative UTF-8 byte estimate plus framing;
+this is a bounded estimate, not an exact model-specific tokenizer count.
+
+Chunks are prioritized by Cohere score when all results have one, otherwise by
+vector similarity; ties preserve retrieval order. Whole chunks are included only
+when they fit. Oversized passages are skipped so smaller passages can still fit,
+without truncating technical facts or the question. Only included evidence gets
+a citation mapping. Mixed reranked/vector-only result sets are rejected.
+Invalid inputs/configuration produce typed `PromptConstructionError` errors.
+If mandatory instructions and the complete question exceed the budget,
+`BUDGET_EXCEEDED` is raised.
+
+The backend prepares this prompt after optional reranking and keeps ordinary
+chat working independently, as requested. The prepared messages are **not yet
+sent to the model**. `X-RAG-Prompt-Status` reports `ready`, `empty`, or `unavailable`;
+`X-RAG-Prompt-Sources` reports the included citation count. Prompt construction
+errors do not block existing ordinary chat. These headers do not imply that the
+current streamed answer is grounded in documents. No new credentials are needed.
+
+Verify formatting, source mapping, budgets, hostile document data, sample PDF
+pages, and backend preparation with mocked providers:
+
+```powershell
+node --test tests/build-prompt.test.mjs tests/chat-api.test.mjs
+```

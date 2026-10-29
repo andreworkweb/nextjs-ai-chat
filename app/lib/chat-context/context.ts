@@ -20,6 +20,11 @@ const encoder = new TextEncoder();
 
 export type ProviderMessage = Pick<ChatMessage, "role" | "content">;
 
+/** Shared conservative estimate: UTF-8 content bytes plus message framing. */
+export function estimateMessageTokens(message: { content: string }): number {
+  return encoder.encode(message.content).byteLength + MESSAGE_OVERHEAD_TOKENS;
+}
+
 export class ChatContextError extends Error {
   readonly status: number;
 
@@ -135,10 +140,7 @@ export function parseChatRequest(value: unknown): ChatRequest {
 export function buildContext(request: ChatRequest): ProviderMessage[] {
   const history = request.history ?? [];
   const current: ProviderMessage = { role: "user", content: request.message };
-  let remaining =
-    INPUT_BUDGET -
-    encoder.encode(current.content).byteLength -
-    MESSAGE_OVERHEAD_TOKENS;
+  let remaining = INPUT_BUDGET - estimateMessageTokens(current);
   let historyBytes = 0;
   let start = history.length;
 

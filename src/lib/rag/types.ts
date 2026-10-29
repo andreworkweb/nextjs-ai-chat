@@ -36,3 +36,30 @@ export interface VectorSearchResult extends ParsedPage {
 export interface RerankedChunk extends VectorSearchResult {
   rerankScore?: number;
 }
+
+export type CitationLabel = `[S${number}]`;
+
+/** Real source identity for a citation present in the constructed prompt. */
+export interface CitationSource {
+  documentId: string;
+  sourceName: string;
+  chunkId: string;
+  chunkIndex: number;
+  pageNumber: number;
+  page: number;
+}
+
+export interface RagPromptMessage {
+  role: "system" | "user";
+  content: string;
+}
+
+export interface BuiltPrompt {
+  messages: RagPromptMessage[];
+  sources: Partial<Record<CitationLabel, CitationSource>>;
+  /** Conservative budget units, not an exact model-specific tokenizer count. */
+  estimatedTokens: number;
+  tokenBudget: number;
+  includedChunkCount: number;
+  omittedChunkCount: number;
+}

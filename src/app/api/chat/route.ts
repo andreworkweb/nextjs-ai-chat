@@ -6,6 +6,8 @@ import { searchVectors } from "../../../lib/rag/search-vectors.ts";
 import { QdrantStorageError } from "../../../lib/rag/qdrant.ts";
 import type { VectorSearchResult } from "../../../lib/rag/types.ts";
 import { rerankChunks } from "../../../lib/rag/rerank-chunks.ts";
+import { buildPrompt, PromptConstructionError } from "../../../lib/rag/build-prompt.ts";
+import type { BuiltPrompt } from "../../../lib/rag/types.ts";
 
 // next.config.ts enables cacheComponents, which requires the Node.js runtime.
 // This Next.js version rejects route-level runtime exports with that setting.
@@ -54,7 +56,14 @@ export async function POST(request: Request): Promise<Response> {
     const selectedChunks = retrievedChunks === null ? null
       : await rerankChunks(query.question, retrievedChunks, { signal });
     signal.throwIfAborted();
-    // Selected passages are available for the next context-building step.
+    // Prepare the RAG prompt locally. Sending it to the model is a later step;
+    // the existing ordinary chat path remains available independently.
+    let preparedPrompt: BuiltPrompt | null = null;
+    try {
+      preparedPrompt = buildPrompt(query.question, selectedChunks ?? []);
+    } catch (error) {
+      if (!(error instanceof PromptConstructionError)) throw error;
+    }
     const messages = buildContext({ ...query, message: query.question });
     generating = true;
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -101,6 +110,8 @@ export async function POST(request: Request): Promise<Response> {
         "X-RAG-Retrieved-Chunks": String(retrievedChunks?.length ?? 0),
         "X-RAG-Rerank-Status": selectedChunks?.some((chunk) => chunk.rerankScore !== undefined) ? "ready" : "original",
         "X-RAG-Selected-Chunks": String(selectedChunks?.length ?? 0),
+        "X-RAG-Prompt-Status": preparedPrompt === null ? "unavailable" : preparedPrompt.includedChunkCount ? "ready" : "empty",
+        "X-RAG-Prompt-Sources": String(preparedPrompt?.includedChunkCount ?? 0),
       },
     });
   } catch (error) {
