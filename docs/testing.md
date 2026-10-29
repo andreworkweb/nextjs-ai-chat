@@ -45,7 +45,7 @@ Live checks require reachable services, valid private credentials, and appropria
 | `RUN_EMBEDDINGS_INTEGRATION=1` | `generate-embeddings.integration.test.mjs` | Verifies OpenRouter authentication, then embeds short synthetic inputs; rejected authentication is skipped. |
 | `RUN_QDRANT_INTEGRATION=1` | `qdrant.integration.test.mjs` | Ensures compatible collection/index configuration, checks stored points, read-back, and similarity search. May create missing collection/indexes; run after ingestion. |
 | `RUN_VECTOR_SEARCH_INTEGRATION=1` | `search-vectors.integration.test.mjs` | Embeds two fixture questions and checks expected source pages, filters, thresholds, and empty matches; no index writes or answer generation. |
-| `RUN_ANSWER_INTEGRATION=1` | `generate-answer.integration.test.mjs` | Streams an answer from synthetic evidence and, when Qdrant is configured, runs a complete read-only sample retrieval/answer query. |
+| `RUN_ANSWER_INTEGRATION=1` | `generate-answer.integration.test.mjs` | Checks synthetic grounding, Russian conversation memory, unsupported TaskFlow pricing, Russian answers from English evidence, and (when Qdrant is configured) a complete sample retrieval/answer query. |
 
 There is no separate live Cohere test. Mock HTTP covers enabled reranking, score mapping, sorting, failures, and cancellation. If testing optional reranking manually, confirm `X-RAG-Rerank-Status: ready`; a successful request can otherwise be a fallback.
 
@@ -107,7 +107,7 @@ try {
 2. Open [localhost:3000](http://localhost:3000) and ask “What is the TaskFlow API rate limit? Cite the source.”
 3. Confirm that text appears incrementally and inspect the completed answer's Sources list. The API guide fixture identifies page 3 as relevant evidence; exact model wording and label numbers can vary.
 4. After availability checking completes, open a source. Confirm that the original PDF opens and the viewer navigates to the physical page when supported.
-5. Reload, verify that the answer and citations remain, then send a second self-contained question. Earlier source lists should remain attached to their answers.
+5. Reload, verify that the answer and citations remain, then send a follow-up. Also try a general question in Russian, share your name, and ask the assistant to recall it. Earlier source lists should remain attached to their answers.
 6. Use **New chat** to clear history. During another request, reset the chat to confirm late text does not repopulate it.
 7. Send `{ "question": " " }` to `/api/chat` and confirm a safe 400 validation response. Inspect [diagnostic headers](api.md#diagnostic-headers) for a valid request.
 

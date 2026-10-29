@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { afterEach, beforeEach, mock, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { buildPrompt } from "../src/lib/rag/build-prompt.ts";
-import { AnswerGenerationError, generateAnswer, INSUFFICIENT_EVIDENCE } from "../src/lib/rag/generate-answer.ts";
+import { AnswerGenerationError, generateAnswer } from "../src/lib/rag/generate-answer.ts";
 import { readChatStream } from "../app/lib/read-chat-stream.ts";
 import { completionEvent, completionResponse } from "./helpers/openrouter-stream.mjs";
 
@@ -80,12 +80,20 @@ test("default model is the existing project model and source identities survive 
   await text(answer);
 });
 
-test("empty useful context streams an honest abstention without an LLM request or credentials", async () => {
-  delete process.env.OPENROUTER_API_KEY;
-  const answer = await generateAnswer(buildPrompt("Unrelated question?", []));
-  assert.equal(answer.status, "insufficient-evidence");
+test("empty document context still allows natural conversation through the real SDK", async () => {
+  let calls = 0;
+  const answer = await generateAnswer(buildPrompt("Привет! Как дела?", []), { fetch: async (_url, init) => {
+    calls++;
+    const messages = JSON.parse(init.body).messages;
+    assert.match(messages[0].content, /Always respond in the user's language, including Russian/);
+    assert.match(messages[0].content, /A missing document context does not prevent general conversation/);
+    assert.equal(JSON.parse(messages.at(-1).content).question, "Привет! Как дела?");
+    return completionResponse("Привет! Чем могу помочь?");
+  } });
+  assert.equal(answer.status, "general");
   assert.deepEqual(answer.sources, {});
-  assert.equal(await text(answer), INSUFFICIENT_EVIDENCE);
+  assert.equal(await text(answer), "Привет! Чем могу помочь?");
+  assert.equal(calls, 1);
   assert.equal(globalThis.fetch.mock.callCount(), 0);
 });
 

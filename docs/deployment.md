@@ -59,12 +59,12 @@ There is no authentication/session document policy in this checkout. Private/unl
 | Embedding input exceeds context | Reduce chunk size and overlap as appropriate. The default Liquid model has a 512-token input limit; the chunker measures string length. Query text is embedded whole and is also subject to that limit. |
 | `OCR_REQUIRED` or protected PDF error | Supply a text-bearing, unlocked PDF. OCR/password removal is not implemented in the pipeline. |
 | Old text remains after renaming/removing a file | Ingestion only cleans revisions for successfully processed source paths. Retired source paths need deliberate database cleanup. |
-| `503 RAG_UNAVAILABLE` | Check query embedding, Qdrant access, collection existence, dimensions, and ingestion results. Retrieval errors do not fall back to general-knowledge generation. |
-| Insufficient-evidence text | Inspect the index, `RAG_SEARCH_MIN_SCORE`, and the context budget. Empty results or no fitting passages intentionally bypass the LLM. |
+| Retrieval status is `unavailable` | Check query embedding, Qdrant access, collection existence, dimensions, and ingestion results. General chat remains available, but document claims cannot be verified. |
+| Insufficient-evidence text | Inspect the index, `RAG_SEARCH_MIN_SCORE`, and the context budget. The model must acknowledge unsupported document claims in the user's language; empty results do not block general questions. |
 | Reranking stays `original` | It is off by default. Check the key, enabled flag, model ID, timeout, and accepted ranges. Optional failures fall back safely. |
 | Provider model unavailable or answer fails | Choose an accessible OpenRouter `LLM_MODEL`, check quotas, and keep input/output budgets within its limits. Model defaults do not guarantee availability. |
 | Stream ends before completion | Inspect the safe SSE error. Check timeouts, provider connectivity, and host streaming limits; incomplete turns are not committed as successful answers. |
-| Follow-up question misses earlier context | Earlier turns remain visible but are not sent to the current answer model. Restate the subject in the question. |
+| Follow-up question misses earlier context | Recent complete turns reach the answer model within the prompt budget. Very old/large turns can be omitted; query embedding still uses the current question, so a self-contained document question can improve retrieval. |
 | Citation has no link | It may refer to text or an unlisted/custom PDF. Only the explicitly public samples with matching original bytes, ID, and successful HEAD checks link. |
 | Document route returns 404 | Missing, changed, invalid, private, and unlisted files intentionally share the same response. Check the allowlist, original hash, and deployment trace. |
 | PDF opens without page navigation | `#page=N` depends on browser PDF viewer support; the source list still shows the physical page. |

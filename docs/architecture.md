@@ -34,13 +34,12 @@ flowchart TD
   embed --> search["Qdrant vector query"]
   search --> rerank["Optional Cohere Rerank"]
   rerank --> prompt["Budget complete passages and assign labels"]
-  prompt --> fits{"Included evidence?"}
-  fits -->|Yes| generate["OpenRouter Chat Completions via AI SDK"]
-  fits -->|No| fallback["Deterministic insufficient-evidence text"]
+  embed -. retrieval unavailable .-> prompt
+  search -. retrieval unavailable .-> prompt
+  prompt --> generate["Universal assistant via AI SDK"]
   generate --> text["Stream text deltas"]
   text --> citations["Resolve labels; emit valid citations when present"]
   citations --> done["DONE"]
-  fallback --> done
 ```
 
 The active [`app/api/chat/route.ts`](../app/api/chat/route.ts) re-exports [`src/app/api/chat/route.ts`](../src/app/api/chat/route.ts). Root `app/` is the Next.js application directory. The project enables `cacheComponents`; keep the route on the Node.js server and heed the installed Next.js guide before changing route configuration.
@@ -86,25 +85,23 @@ Successful `RerankedChunk` results add `rerankScore` in `[0, 1]` while retaining
 
 ### Context construction
 
-`buildPrompt(question, chunks, options?)` performs no network requests. Its typed `BuiltPrompt` contains two messages, a source map, a budget estimate, and included/omitted chunk counts. The system message instructs the model to use supplied evidence, cite valid labels, disclose insufficient evidence, and describe conflicts.
+`buildPrompt(question, chunks, options?)` performs no network requests. Its typed `BuiltPrompt` contains a system message, optional recent user/assistant turns, a final JSON user message, a source map, a budget estimate, and included/omitted chunk counts. The system instructions permit natural general assistance, require replies in the user's language, and require evidence for TaskFlow/indexed-document claims. Unsupported document facts must be acknowledged rather than invented, including prices, features, and policies.
 
 The JSON user message contains the complete question and explicitly untrusted evidence. Filenames and document text cannot create additional message roles. This separation reduces prompt-injection risk; it is not a guarantee of model compliance.
 
-The default budget of 8192 includes instructions, question, JSON structure, metadata, passages, and framing. Accounting conservatively estimates one unit per UTF-8 byte plus message overhead; it is not a model-specific tokenizer. Complete passages are included in relevance order only when they fit. Oversized passages are skipped so smaller ones can still fit; question and passage text are never shortened.
+The default budget of 8192 includes instructions, complete recent history turns, question, JSON structure, metadata, passages, and framing. Accounting conservatively estimates one unit per UTF-8 byte plus message overhead; it is not a model-specific tokenizer. Existing history validation and trimming are reused. When passages exist, at most half the remaining budget is used for recent history, leaving room for evidence; without passages, history may use the full remaining budget. Complete passages are included in relevance order only when they fit. Oversized passages are skipped so smaller ones can still fit; question and passage text are never shortened.
 
 Complete reranked sets use Cohere relevance; other sets use vector similarity. Ties preserve order. Mixed score types are rejected. Only included passages receive `[S1]`, `[S2]`, and subsequent response-local mappings to real document/chunk/page identities. Invalid settings produce `PromptConstructionError`; mandatory instructions and question exceeding the budget produce `BUDGET_EXCEEDED`.
 
 ### Answer generation
 
-`generateAnswer(builtPrompt, options?)` validates the structured prompt and returns `{ stream, sources, status }`. The source map is cloned server-side. With zero included passages, it emits this deterministic response and completion marker without a model request:
+`generateAnswer(builtPrompt, options?)` validates the structured prompt and returns `{ stream, sources, status }`. The source map is cloned server-side. Empty context still reaches the model so general conversation and localized uncertainty work naturally. Known retrieval failures are marked with `documentContext.unavailable`; they do not block general chat or authorize unsupported product claims.
 
-> The supplied documents do not provide enough information to answer this question.
-
-Otherwise, Vercel AI SDK 7 `streamText` uses `instructions` and `result.stream`, with `@ai-sdk/openai`'s Chat Completions adapter pointed at `https://openrouter.ai/api/v1`. This path does not use the OpenAI Responses API or AI Gateway. The output cap is 8192 tokens; automatic generation retries are disabled to avoid duplicate output.
+Vercel AI SDK 7 `streamText` uses `instructions`, ordered conversation messages, and `result.stream`, with `@ai-sdk/openai`'s Chat Completions adapter pointed at `https://openrouter.ai/api/v1`. This path does not use the OpenAI Responses API or AI Gateway. The output cap is 8192 tokens; automatic generation retries are disabled to avoid duplicate output. No intent-classifier model call or separate chat pipeline is introduced: the same answer model decides when the supplied evidence is relevant.
 
 The server waits for the first actual text before sending successful headers, allowing early failures to use HTTP status codes. Later failures become a sanitized SSE error without `[DONE]`. Only successfully completed responses commit answer citations. Reasoning, prompts, SDK/provider metadata, raw errors, and credentials are not forwarded.
 
-The answer is prompted to stay within the evidence. Nonempty retrieval is not proof of relevance; the model can still misinterpret evidence. [Citations verify identity, not truth](api.md#citations-and-original-pdfs).
+Document claims are prompted to stay within the evidence; unrelated questions use general knowledge and reasoning with uncertainty when needed. Nonempty retrieval is not proof of relevance; the model can still misinterpret evidence. [Citations verify identity, not truth](api.md#citations-and-original-pdfs).
 
 ## Cancellation and deadlines
 
@@ -119,6 +116,6 @@ The answer is prompted to stay within the evidence. Nonempty retrieval is not pr
 
 ## Browser state and trust boundaries
 
-The UI stores one anonymous browser profile's conversation in `localStorage`, validates it on restoration, and retains a full chronological transcript. A bounded suffix of completed turns is sent as metadata: at most 100 messages and 48 KiB of text. The current route validates history but does not send it to the answer model or use it for query rewriting. Conversation IDs identify browser state, not authenticated users.
+The UI stores one anonymous browser profile's conversation in `localStorage`, validates it on restoration, and retains a full chronological transcript. A bounded suffix of completed turns is sent as metadata: at most 100 messages and 48 KiB of text. The route passes recent complete turns to the answer model within the prompt budget. It embeds the current question without query rewriting. Conversation IDs identify browser state, not authenticated users.
 
 Duplicate submissions are locked within a tab, with Web Locks coordination when available across tabs. Reset cancels generation. Interrupted responses never commit partial citation maps; resending the failed question can reuse its turn ID. Storage failures preserve functioning in-memory chat and show an error. See [testing](testing.md) for verification steps.

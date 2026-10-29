@@ -6,7 +6,6 @@ import { MAX_COMPLETION_TOKENS, estimateMessageTokens } from "../../../app/lib/c
 import type { BuiltPrompt } from "./types.ts";
 import { resolveCitations } from "../../../app/lib/chat-context/citations.ts";
 
-export const INSUFFICIENT_EVIDENCE = "The supplied documents do not provide enough information to answer this question.";
 const DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
 
 export class AnswerGenerationError extends Error {
@@ -31,7 +30,7 @@ export interface GeneratedAnswer {
   stream: ReadableStream<Uint8Array>;
   /** Server-side citation identity, retained for the next citation presentation step. */
   sources: BuiltPrompt["sources"];
-  status: "grounded" | "insufficient-evidence";
+  status: "grounded" | "general";
 }
 
 function safeError(error: unknown, signal: AbortSignal): AnswerGenerationError {
@@ -64,8 +63,9 @@ function textEvent(text: string): Uint8Array {
 
 /** Accept only the bounded structured prompt produced by buildPrompt. */
 function validatePrompt(prompt: BuiltPrompt): void {
-  if (!prompt || !Array.isArray(prompt.messages) || prompt.messages.length !== 2
-    || prompt.messages[0]?.role !== "system" || prompt.messages[1]?.role !== "user"
+  if (!prompt || !Array.isArray(prompt.messages) || prompt.messages.length < 2 || prompt.messages.length % 2 !== 0
+    || prompt.messages[0]?.role !== "system"
+    || prompt.messages.slice(1).some((message, index) => message?.role !== (index % 2 === 0 ? "user" : "assistant"))
     || prompt.messages.some((message) => typeof message.content !== "string" || !message.content.trim())
     || !prompt.sources || typeof prompt.sources !== "object" || Array.isArray(prompt.sources)
     || !Number.isSafeInteger(prompt.includedChunkCount) || prompt.includedChunkCount < 0
@@ -75,7 +75,7 @@ function validatePrompt(prompt: BuiltPrompt): void {
     throw new AnswerGenerationError("INVALID_PROMPT", "A valid bounded evidence prompt is required.", 400);
   }
   try {
-    const data = JSON.parse(prompt.messages[1].content);
+    const data = JSON.parse(prompt.messages[prompt.messages.length - 1].content);
     if (typeof data.question !== "string" || !data.question.trim()
       || !Array.isArray(data.documentContext?.sources)
       || data.documentContext.sources.length !== prompt.includedChunkCount
@@ -105,16 +105,6 @@ export async function generateAnswer(prompt: BuiltPrompt, options: GenerateAnswe
   options.signal?.throwIfAborted();
   const sources = structuredClone(prompt.sources);
   const messages = prompt.messages.map((message) => ({ ...message }));
-  if (prompt.includedChunkCount === 0) {
-    return {
-      status: "insufficient-evidence", sources,
-      stream: new ReadableStream({ start(controller) {
-        controller.enqueue(textEvent(INSUFFICIENT_EVIDENCE));
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        controller.close();
-      } }),
-    };
-  }
 
   const apiKey = env.OPENROUTER_API_KEY?.trim();
   const model = env.LLM_MODEL === undefined ? DEFAULT_MODEL : env.LLM_MODEL.trim();
@@ -144,7 +134,7 @@ export async function generateAnswer(prompt: BuiltPrompt, options: GenerateAnswe
       const result = streamText({
         model: provider.chat(model),
         instructions: messages[0].content,
-        messages: [messages[1]],
+        messages: messages.slice(1),
         maxOutputTokens: MAX_COMPLETION_TOKENS,
         maxRetries: 0,
         abortSignal: signal,
@@ -181,7 +171,7 @@ export async function generateAnswer(prompt: BuiltPrompt, options: GenerateAnswe
   if (first.done) throw new AnswerGenerationError("AI_EMPTY_RESPONSE", "The AI service returned no answer text.", 502);
   let answerText = first.value;
   return {
-    status: "grounded", sources,
+    status: prompt.includedChunkCount ? "grounded" : "general", sources,
     stream: new ReadableStream<Uint8Array>({
       start(controller) { controller.enqueue(textEvent(first.value)); },
       async pull(controller) {

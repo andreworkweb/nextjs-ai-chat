@@ -74,7 +74,7 @@ Both embedding and answer model IDs are configurable on the server. The default 
 
 | Capability | What is implemented |
 | :--- | :--- |
-| **Document-grounded answers** | Semantic retrieval followed by an evidence-only prompt; empty context produces an explicit insufficient-evidence response without an LLM call. |
+| **Universal assistant with document grounding** | Natural general conversation and multilingual answers; TaskFlow/document claims require supplied evidence, with explicit uncertainty when information is missing. |
 | **PDF, text, and Markdown ingestion** | Recursive local indexing with normalization, page-preserving chunks, embeddings, and verified database writes. |
 | **Semantic search** | Configurable result count and Cosine threshold, plus metadata allowlists available to trusted server code. |
 | **Optional reranking** | Cohere scores reorder and select passages; unavailable reranking preserves all original vector hits. |
@@ -83,7 +83,7 @@ Both embedding and answer model IDs are configurable on the server. The default 
 | **Verified source identity** | Response-local citation labels resolve only against passages actually included in the prompt. |
 | **Original PDF links** | Available, explicitly allowlisted sample PDFs open in a new tab at the cited page when the viewer supports it. |
 
-Saved turns remain visible, but the current RAG handler embeds and answers **only the current question**. It does not pass earlier turns to the answer model. Ask self-contained questions rather than relying on conversational follow-up resolution.
+The answer model receives a bounded suffix of completed conversation turns to understand follow-ups. Responses use the user's language, including Russian, regardless of the document language. Earlier assistant claims do not substitute for document evidence.
 
 ## Demo
 
@@ -127,12 +127,11 @@ flowchart TD
     question["Validate current question"] --> query["OpenRouter query embedding"]
     query --> search["Vector search"]
     search --> rerank["Optional Cohere rerank"]
-    rerank --> context["Bounded evidence and source labels"]
-    context --> evidence{"Evidence fits?"}
-    evidence -->|Yes| llm["OpenRouter LLM via AI SDK"]
-    evidence -->|No| insufficient["Insufficient-evidence response"]
+    rerank --> context["Bounded conversation, optional evidence, source labels"]
+    query -. retrieval unavailable .-> context
+    search -. retrieval unavailable .-> context
+    context --> llm["Universal assistant via AI SDK"]
     llm --> stream["SSE answer; valid citations when present"]
-    insufficient --> stream
   end
   qdrant --> search
   stream --> browser["Browser chat and local history"]
@@ -269,7 +268,7 @@ Run `npm run ingest` after adding or editing PDF, UTF-8 TXT, `.md`, or `.markdow
 
 `POST /api/chat` accepts a JSON `question` and returns Server-Sent Events. Search defaults to ten hits; successful optional reranking keeps five. The prompt builder includes only whole passages that fit its budget. Generation uses the AI SDK's OpenAI-compatible adapter with a fixed OpenRouter endpoint.
 
-An empty search or context emits a deterministic insufficient-evidence answer. Retrieval failures return a safe error; unavailable optional reranking falls back to vector order. A nonempty result does not guarantee that the evidence answers the question, and model grounding remains subject to model behavior.
+The same model answers general questions naturally and uses retrieved evidence when document information is needed. Empty results do not block general conversation; unsupported document questions receive a clear acknowledgment in the user's language. Known retrieval failures mark evidence as unavailable while keeping general chat available. Optional reranking still falls back to vector order. A nonempty result does not guarantee that the evidence answers the question, and model grounding remains subject to model behavior.
 
 [Pipeline contracts →](docs/architecture.md) · [Request, stream, headers, and errors →](docs/api.md)
 
@@ -307,7 +306,7 @@ For a production build, run `npm run build`, then `npm start`. The [deployment g
 | Ingestion cannot connect | Use the cluster's HTTPS `.cloud.qdrant.io` URL and a write-capable key. |
 | Collection mismatch | Model dimensions and unnamed Cosine collection settings must agree. Use a separate collection for a new vector space. |
 | Embedding request rejected | Verify model access and input token limits; chunk sizes count characters, not tokens. |
-| `503 RAG_UNAVAILABLE` | Check embedding configuration, cloud access, and whether ingestion completed. |
+| Retrieval status is `unavailable` | Check embedding configuration, cloud access, and whether ingestion completed. General chat can continue, but document facts cannot be verified. |
 | Insufficient-evidence answer | Inspect the collection, score threshold, and context budget. |
 | Sources remain plain text | Only the allowlisted PDFs can open; their original bytes and hashes must match. |
 | History is not restored | Allow browser storage; use **New chat** to reset invalid saved history. |

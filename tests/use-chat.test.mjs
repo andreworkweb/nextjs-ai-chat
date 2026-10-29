@@ -253,8 +253,11 @@ test("the chat API streams grounded evidence and preserves stored conversation h
     }
     const messages = JSON.parse(options.body).messages;
     assert.equal(messages[0].role, "system");
-    assert.equal(JSON.parse(messages[1].content).question, "Which color?");
-    assert.equal(JSON.parse(messages[1].content).documentContext.sources[0].text, "The project color is Blue.");
+    assert.deepEqual(messages.slice(1, -1), [
+      { role: "user", content: "Remember blue" }, { role: "assistant", content: "I remember blue" },
+    ]);
+    assert.equal(JSON.parse(messages.at(-1).content).question, "Which color?");
+    assert.equal(JSON.parse(messages.at(-1).content).documentContext.sources[0].text, "The project color is Blue.");
     return completionResponse("Blue");
   });
   t.after(() => {

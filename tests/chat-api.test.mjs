@@ -4,7 +4,6 @@ import { QdrantClient } from "@qdrant/js-client-rest";
 import { POST } from "../src/app/api/chat/route.ts";
 import { POST as activePOST } from "../app/api/chat/route.ts";
 import { buildPrompt } from "../src/lib/rag/build-prompt.ts";
-import { INSUFFICIENT_EVIDENCE } from "../src/lib/rag/generate-answer.ts";
 import { completionResponse } from "./helpers/openrouter-stream.mjs";
 import { readChatStream } from "../app/lib/read-chat-stream.ts";
 import {
@@ -82,9 +81,9 @@ test("the active Next.js route forwards the question handler", async () => {
   assert.equal(response.headers.get("X-RAG-Retrieved-Chunks"), "0");
   assert.equal(response.headers.get("X-RAG-Prompt-Status"), "empty");
   assert.equal(response.headers.get("X-RAG-Prompt-Sources"), "0");
-  assert.equal(response.headers.get("X-RAG-Answer-Status"), "insufficient-evidence");
-  assert.ok((await response.text()).includes(INSUFFICIENT_EVIDENCE));
-  assert.equal(globalThis.fetch.mock.callCount(), 1);
+  assert.equal(response.headers.get("X-RAG-Answer-Status"), "general");
+  assert.equal(await response.text(), streamText);
+  assert.equal(globalThis.fetch.mock.callCount(), 2);
 });
 
 test("a valid question streams a real provider response using server-owned settings", async () => {
@@ -265,15 +264,18 @@ test("a missing server API key returns a clear error without a provider call", a
   assert.equal(globalThis.fetch.mock.callCount(), 0);
 });
 
-test("conversation history is validated but cannot override document evidence", async () => {
+test("conversation history reaches the model while document facts still require evidence", async () => {
   const controller = new AbortController();
   let upstreamSignal;
   mockChatFetch(async (_url, options) => {
     upstreamSignal = options.signal;
     const messages = JSON.parse(options.body).messages;
-    assert.equal(messages.length, 2);
-    assert.equal(JSON.parse(messages[1].content).question, "Which color?");
-    assert.ok(!options.body.includes("Remember blue"));
+    assert.equal(messages.length, 4);
+    assert.deepEqual(messages.slice(1, -1), [
+      { role: "user", content: "Remember blue" }, { role: "assistant", content: "I remember blue" },
+    ]);
+    assert.equal(JSON.parse(messages.at(-1).content).question, "Which color?");
+    assert.match(messages[0].content, /Previous assistant claims are not authoritative evidence/);
     return completionResponse();
   });
   const response = await POST(request({
@@ -354,9 +356,9 @@ test("the backend embeds the current question, searches, and then generates a ch
       return embeddingResponse();
     }
     stages.push("chat");
-    assert.equal(body.messages.length, 2);
+    assert.equal(body.messages.length, 4);
     assert.equal(body.queryVector, undefined);
-    const evidence = JSON.parse(body.messages[1].content).documentContext.sources[0];
+    const evidence = JSON.parse(body.messages.at(-1).content).documentContext.sources[0];
     assert.equal(evidence.text, "Private retrieved passage stays on the server.");
     assert.equal(evidence.documentId, "document-id");
     assert.equal(evidence.pageNumber, 3);
@@ -379,7 +381,7 @@ test("the backend embeds the current question, searches, and then generates a ch
   assert.deepEqual(stages, ["embed", "search", "chat"]);
 });
 
-test("embedding failures return safe retrieval errors and never generate ungrounded answers", async () => {
+test("embedding failures preserve general chat with unavailable evidence and no citations", async () => {
   for (const failure of [
     () => new Response("private embedding details test-only-key", { status: 429 }),
     () => new Response("private embedding details test-only-key", { status: 503 }),
@@ -389,11 +391,14 @@ test("embedding failures return safe retrieval errors and never generate ungroun
     mock.method(globalThis, "fetch", async (url) => url === "https://openrouter.ai/api/v1/embeddings"
       ? failure() : completionResponse());
     const response = await POST(request({ question: "Hi" }));
-    assert.equal(response.status, 503);
-    const payload = await response.json();
-    assert.equal(payload.code, "RAG_UNAVAILABLE");
-    assert.doesNotMatch(JSON.stringify(payload), /private embedding|test-only-key/);
-    assert.equal(globalThis.fetch.mock.callCount(), 1);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("X-RAG-Search-Status"), "unavailable");
+    assert.equal(response.headers.get("X-RAG-Answer-Status"), "general");
+    assert.equal(await response.text(), streamText);
+    const body = JSON.parse(globalThis.fetch.mock.calls[1].arguments[1].body);
+    assert.deepEqual(JSON.parse(body.messages.at(-1).content).documentContext.sources, []);
+    assert.equal(JSON.parse(body.messages.at(-1).content).documentContext.unavailable, true);
+    assert.equal(globalThis.fetch.mock.callCount(), 2);
   }
 });
 
@@ -412,16 +417,18 @@ test("cancelling query embedding does not start chat generation", async () => {
   assert.equal(QdrantClient.prototype.query.mock.callCount(), 0);
 });
 
-test("database failures return a service error without exposing private details or calling the LLM", async () => {
+test("database failures preserve general conversation without leaking private details", async () => {
   mock.method(QdrantClient.prototype, "query", async () => {
     throw Object.assign(new Error("fake-qdrant-test-key private database details"), { status: 503 });
   });
   const response = await POST(request({ question: "Hi" }));
-  assert.equal(response.status, 503);
-  const payload = await response.json();
-  assert.equal(payload.code, "RAG_UNAVAILABLE");
-  assert.doesNotMatch(JSON.stringify(payload), /fake-qdrant-test-key|private database/);
-  assert.equal(globalThis.fetch.mock.callCount(), 1);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("X-RAG-Search-Status"), "unavailable");
+  assert.equal(await response.text(), streamText);
+  const body = JSON.parse(globalThis.fetch.mock.calls[1].arguments[1].body);
+  assert.equal(JSON.parse(body.messages.at(-1).content).documentContext.unavailable, true);
+  assert.doesNotMatch(JSON.stringify(body), /fake-qdrant-test-key|private database/);
+  assert.equal(globalThis.fetch.mock.callCount(), 2);
 });
 
 test("cancelling vector search prevents chat generation", async () => {
@@ -573,4 +580,43 @@ test("client cancellation during reranking prevents chat generation", async () =
   });
   await expectError(request({ question: "Hi" }, { signal: controller.signal }), 499, "REQUEST_CANCELLED");
   assert.equal(upstream.mock.callCount(), 2);
+});
+
+test("Russian general conversation works with unrelated retrieved documents and preserves dialogue context", async () => {
+  const upstream = mockChatFetch(async (_url, init) => {
+    const messages = JSON.parse(init.body).messages;
+    assert.match(messages[0].content, /For general or unrelated questions/);
+    assert.match(messages[0].content, /Always respond in the user's language, including Russian/);
+    assert.deepEqual(messages.slice(1, -1), [
+      { role: "user", content: "Меня зовут Алексей." }, { role: "assistant", content: "Рад знакомству!" },
+    ]);
+    assert.equal(JSON.parse(messages.at(-1).content).question, "Как меня зовут?");
+    return completionResponse("Вас зовут Алексей.");
+  });
+  const response = await POST(request({ question: "Как меня зовут?", history: [
+    { id: "first:user", role: "user", content: "Меня зовут Алексей." },
+    { id: "first:assistant", role: "assistant", content: "Рад знакомству!" },
+  ] }));
+  let text = "";
+  const citations = await readChatStream(response.body, (content) => { text += content; });
+  assert.equal(text, "Вас зовут Алексей.");
+  assert.deepEqual(citations, []);
+  assert.equal(upstream.mock.callCount(), 2);
+});
+
+test("unsupported document questions are answered in the user's language without fabricated citations", async () => {
+  mock.method(QdrantClient.prototype, "query", async () => ({ points: [] }));
+  mockChatFetch(async (_url, init) => {
+    const messages = JSON.parse(init.body).messages;
+    assert.match(messages[0].content, /supplied documents do not provide enough information/);
+    assert.match(messages[0].content, /Never invent facts, prices, features, policies/);
+    assert.deepEqual(JSON.parse(messages.at(-1).content).documentContext.sources, []);
+    return completionResponse("В документации нет данных о цене этого тарифа. Я не могу назвать её достоверно.");
+  });
+  const response = await POST(request({ question: "Сколько стоит неизвестный тариф TaskFlow?" }));
+  let text = "";
+  const citations = await readChatStream(response.body, (content) => { text += content; });
+  assert.match(text, /В документации нет данных/);
+  assert.deepEqual(citations, []);
+  assert.ok(!text.includes("[S"));
 });

@@ -50,7 +50,7 @@ export interface CitationSource {
 }
 
 export interface RagPromptMessage {
-  role: "system" | "user";
+  role: "system" | "user" | "assistant";
   content: string;
 }
 

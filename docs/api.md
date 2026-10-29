@@ -26,7 +26,7 @@ Send `Content-Type: application/json` and a JSON object:
 
 The optional `history`, `messageId`, and `conversationId` fields use the existing [conversation validator](../app/lib/chat-context/context.ts). IDs use the allowed identifier format, and history must contain complete alternating user/assistant turns. Duplicate history IDs with conflicting contents are rejected. Invalid conversation metadata is returned as `400 INVALID_REQUEST` by the chat-query wrapper.
 
-History is validated and available to the chat UI; the current RAG handler does not pass it to query embedding or answer generation. Client-supplied model IDs, credentials, system prompts, retrieval filters, and other unrelated fields are ignored.
+History is validated and a bounded suffix of complete turns is passed to the answer model as ordered user/assistant messages. It supports follow-ups, references, and language continuity; prior assistant claims are not document evidence. Query embedding still uses the complete current question. Client-supplied model IDs, credentials, system prompts, retrieval filters, and other unrelated fields are ignored.
 
 ### Try a streaming request
 
@@ -68,7 +68,7 @@ data: [DONE]
 
 ```
 
-The citation event is optional and is sent only when valid cited labels exist after successful generation. It precedes `[DONE]`. The insufficient-evidence path streams deterministic text and `[DONE]` without a model request or citation map.
+The citation event is optional and is sent only when valid cited labels exist after successful generation. It precedes `[DONE]`. The model also handles general questions and insufficient evidence in the user's language. Empty document context is not a fixed-response path and produces no invented source metadata.
 
 The server waits for the first answer text before sending the response so early errors retain meaningful HTTP status codes. If a failure happens after streaming starts, the already-sent HTTP status stays 200 and the stream ends with a safe error event, **without `[DONE]`**:
 
@@ -83,14 +83,14 @@ data: {"error":{"message":"The AI service could not complete the response. Pleas
 
 | Header | Meaning |
 | :--- | :--- |
-| `X-RAG-Query-Status` | `ready` after successful query embedding. |
-| `X-RAG-Search-Status` | `ready` or `empty`. |
+| `X-RAG-Query-Status` | `ready` after successful query embedding, otherwise `unavailable`. |
+| `X-RAG-Search-Status` | `ready`, `empty`, or `unavailable`. |
 | `X-RAG-Retrieved-Chunks` | Pre-reranking hit count. |
 | `X-RAG-Rerank-Status` | `ready` when genuine rerank scores exist; otherwise `original`. |
 | `X-RAG-Selected-Chunks` | Post-reranking/fallback result count. |
 | `X-RAG-Prompt-Status` | `ready` when at least one whole passage fits; otherwise `empty`. |
 | `X-RAG-Prompt-Sources` | Number of included evidence labels, not the number ultimately cited. |
-| `X-RAG-Answer-Status` | `grounded` or `insufficient-evidence`; `grounded` describes the path, not a factual correctness guarantee. |
+| `X-RAG-Answer-Status` | `grounded` when evidence was supplied, otherwise `general`; this describes context availability, not whether an answer cites evidence or is factually correct. |
 
 These headers report pipeline state. Internal vectors, prompts, passage bodies, SDK reasoning, provider error bodies, and credentials are not serialized in this diagnostic metadata.
 
@@ -118,7 +118,7 @@ Early failures return JSON with `Cache-Control: no-store`:
 | `503` | `AI_NOT_CONFIGURED`, embedding/database `RAG_UNAVAILABLE`, or invalid prompt configuration `RAG_PROMPT_ERROR`. |
 | `504` | `AI_TIMEOUT` for a surfaced generation/overall timeout. |
 
-Embedding errors, including exhausted embedding rate limits, are mapped to `503 RAG_UNAVAILABLE`; they are not exposed as generation's 429. Cancellation/deadline errors from an individual stage may be mapped through that stage's safe error handling. Next.js returns **405** for unsupported chat methods. Provider bodies and private exception messages are never included in the public error response.
+Known embedding/database errors mark retrieval unavailable and allow general generation to continue. The model is instructed to disclose unavailable documentation rather than guess document facts. Generation errors still use the status codes above; cancellation and the overall deadline stop the request. Next.js returns **405** for unsupported chat methods. Provider bodies and private exception messages are never included in the public error response.
 
 ## Citations and original PDFs
 

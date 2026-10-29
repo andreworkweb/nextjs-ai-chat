@@ -6,6 +6,7 @@ import { QdrantStorageError } from "../../../lib/rag/qdrant.ts";
 import { rerankChunks } from "../../../lib/rag/rerank-chunks.ts";
 import { buildPrompt, PromptConstructionError } from "../../../lib/rag/build-prompt.ts";
 import { AnswerGenerationError, generateAnswer } from "../../../lib/rag/generate-answer.ts";
+import type { VectorSearchResult } from "../../../lib/rag/types.ts";
 
 // cacheComponents requires Node.js and rejects route-level runtime exports.
 const REQUEST_TIMEOUT_MS = 180_000;
@@ -23,11 +24,22 @@ export async function POST(request: Request): Promise<Response> {
       return errorResponse("The AI service is not configured", "AI_NOT_CONFIGURED", 503);
     }
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
-    const queryVector = await embedQuery(query.question, { signal });
-    const retrievedChunks = await searchVectors(queryVector, { signal });
-    const selectedChunks = await rerankChunks(query.question, retrievedChunks, { signal });
+    let queryVector: number[] | null = null;
+    let retrievedChunks: VectorSearchResult[] | null = null;
+    try {
+      queryVector = await embedQuery(query.question, { signal });
+      retrievedChunks = await searchVectors(queryVector, { signal });
+    } catch (error) {
+      signal.throwIfAborted();
+      if (!(error instanceof EmbeddingGenerationError || error instanceof QdrantStorageError)) throw error;
+      // General conversation remains available. The prompt marks unavailable
+      // evidence so the model cannot claim verified document facts without it.
+    }
+    const selectedChunks = await rerankChunks(query.question, retrievedChunks ?? [], { signal });
     signal.throwIfAborted();
-    const prompt = buildPrompt(query.question, selectedChunks);
+    const prompt = buildPrompt(query.question, selectedChunks, {
+      history: query.history, retrievalUnavailable: retrievedChunks === null,
+    });
     const answer = await generateAnswer(prompt, { signal });
     // Generation resolves cited labels against answer.sources before stream completion.
     // Only answer text and verified display metadata are serialized; prompts stay private.
@@ -36,9 +48,9 @@ export async function POST(request: Request): Promise<Response> {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-store, no-transform",
         "X-Accel-Buffering": "no",
-        "X-RAG-Query-Status": "ready",
-        "X-RAG-Search-Status": retrievedChunks.length ? "ready" : "empty",
-        "X-RAG-Retrieved-Chunks": String(retrievedChunks.length),
+        "X-RAG-Query-Status": queryVector ? "ready" : "unavailable",
+        "X-RAG-Search-Status": retrievedChunks === null ? "unavailable" : retrievedChunks.length ? "ready" : "empty",
+        "X-RAG-Retrieved-Chunks": String(retrievedChunks?.length ?? 0),
         "X-RAG-Rerank-Status": selectedChunks.some((chunk) => chunk.rerankScore !== undefined) ? "ready" : "original",
         "X-RAG-Selected-Chunks": String(selectedChunks.length),
         "X-RAG-Prompt-Status": prompt.includedChunkCount ? "ready" : "empty",

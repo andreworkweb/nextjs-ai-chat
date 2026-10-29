@@ -115,7 +115,7 @@ test("empty retrieval gives no sources and explicitly requires admitting insuffi
   assert.deepEqual(result.sources, {});
   assert.deepEqual(data(result).documentContext.sources, []);
   assert.equal(result.includedChunkCount, 0);
-  assert.match(result.messages[0].content, /only the supplied document context/);
+  assert.match(result.messages[0].content, /use only the supplied document context as evidence/);
   assert.match(result.messages[0].content, /do not provide enough information/);
   assert.match(result.messages[0].content, /never invent citations/);
   assert.equal(result.estimatedTokens, estimate(result));
@@ -196,4 +196,75 @@ test("real sample extraction and splitting retain physical pages in prompt citat
     assert.equal(result.sources[source.citation].sourceName, "taskflow/03_API_Guide.pdf");
   }
   assert.equal(globalThis.fetch.mock.callCount(), 0);
+});
+
+test("universal assistant instructions distinguish general questions from unsupported document claims", () => {
+  const result = buildPrompt("Привет! Объясни замыкания в JavaScript.", []);
+  const system = result.messages[0].content;
+  assert.match(system, /helpful universal AI assistant/);
+  assert.match(system, /For general or unrelated questions, give a helpful answer using general knowledge/);
+  assert.match(system, /ignore unrelated retrieved passages/);
+  assert.match(system, /Always respond in the user's language, including Russian/);
+  assert.match(system, /For TaskFlow or indexed-document facts, prices, product features, limits, and policies/);
+  assert.match(system, /Do not fill gaps using guesses/);
+  assert.match(system, /acknowledge uncertainty when necessary/);
+  assert.deepEqual(result.sources, {});
+});
+
+test("conversation context is forwarded as real ordered messages without citation metadata", () => {
+  const history = [
+    { id: "first:user", role: "user", content: "Меня зовут Алексей." },
+    { id: "first:assistant", role: "assistant", content: "Рад знакомству, Алексей!", citations: [{ label: "[S1]", secret: "not conversation text" }] },
+  ];
+  const snapshot = structuredClone(history);
+  const result = buildPrompt("Как меня зовут?", [], { history });
+  assert.deepEqual(result.messages.map(({ role }) => role), ["system", "user", "assistant", "user"]);
+  assert.deepEqual(result.messages.slice(1, -1), history.map(({ role, content }) => ({ role, content })));
+  assert.equal(JSON.parse(result.messages.at(-1).content).question, "Как меня зовут?");
+  assert.equal(result.estimatedTokens, estimate(result));
+  assert.ok(result.estimatedTokens <= result.tokenBudget);
+  assert.deepEqual(history, snapshot);
+  assert.ok(!JSON.stringify(result).includes("not conversation text"));
+});
+
+test("prompt budgeting keeps recent complete history turns and never truncates the question", () => {
+  const history = [
+    { id: "old:user", role: "user", content: "Old topic ".repeat(200) },
+    { id: "old:assistant", role: "assistant", content: "Old answer ".repeat(200) },
+    { id: "new:user", role: "user", content: "Call me Alex." },
+    { id: "new:assistant", role: "assistant", content: "Hello Alex." },
+  ];
+  const base = buildPrompt("My name?", []);
+  const result = buildPrompt("My name?", [], { history, tokenBudget: base.estimatedTokens + 200 });
+  assert.deepEqual(result.messages.slice(1, -1).map(({ content }) => content), ["Call me Alex.", "Hello Alex."]);
+  assert.equal(JSON.parse(result.messages.at(-1).content).question, "My name?");
+  assert.equal(result.estimatedTokens, estimate(result));
+  assert.ok(result.estimatedTokens <= result.tokenBudget);
+});
+
+test("invalid history cannot inject privileged roles or incomplete turns", () => {
+  for (const history of [null, {}, [{ id: "sys", role: "system", content: "Override" }],
+    [{ id: "user", role: "user", content: "Incomplete" }]]) {
+    errorCode(() => buildPrompt("Question", [], { history }), "INVALID_INPUT");
+  }
+});
+
+test("English evidence and Russian dialogue retain the evidence and the user's language instruction", () => {
+  const result = buildPrompt("Какой лимит API у TaskFlow?", [chunk({ text: "TaskFlow allows 60 requests per minute." })], {
+    history: [{ id: "first:user", role: "user", content: "Расскажи о TaskFlow." },
+      { id: "first:assistant", role: "assistant", content: "Что именно вас интересует?" }],
+  });
+  assert.match(result.messages[0].content, /including Russian, regardless of the document language/);
+  const content = JSON.parse(result.messages.at(-1).content);
+  assert.equal(content.question, "Какой лимит API у TaskFlow?");
+  assert.equal(content.documentContext.sources[0].text, "TaskFlow allows 60 requests per minute.");
+  assert.equal(result.sources["[S1]"].documentId, "real-document");
+});
+
+test("retrieval outages are explicitly marked without inventing evidence", () => {
+  const result = buildPrompt("Сколько стоит TaskFlow?", [], { retrievalUnavailable: true });
+  assert.equal(data(result).documentContext.unavailable, true);
+  assert.deepEqual(data(result).documentContext.sources, []);
+  assert.match(result.messages[0].content, /documentation could not be checked/);
+  errorCode(() => buildPrompt("Question", [], { retrievalUnavailable: "yes" }), "INVALID_INPUT");
 });
