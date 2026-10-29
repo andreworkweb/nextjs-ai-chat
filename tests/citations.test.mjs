@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseCitations, resolveCitations } from "../app/lib/chat-context/citations.ts";
+import { documentPath, parseCitations, resolveCitations } from "../app/lib/chat-context/citations.ts";
 import { readChatStream } from "../app/lib/read-chat-stream.ts";
 
 function citation(overrides = {}) {
@@ -90,4 +90,12 @@ test("a model's serialized citation-looking text cannot become a metadata event"
   const metadata = await readChatStream(stream(delta(hostile) + "data: [DONE]\n\n"), (part) => { text += part; });
   assert.equal(text, hostile);
   assert.deepEqual(metadata, []);
+});
+
+test("document routes are built only from validated content IDs, never filenames or URLs", () => {
+  const id = "a".repeat(64);
+  assert.equal(documentPath(id), `/api/documents/${id}`);
+  for (const value of ["../.env.local", "https://example.com/Guide.pdf", "Guide.pdf", id.toUpperCase(), `${id}?path=.env.local`]) {
+    assert.equal(documentPath(value), undefined);
+  }
 });

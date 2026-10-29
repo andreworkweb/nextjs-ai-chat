@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { readChatStream } from "../read-chat-stream";
 import { resolveCitations } from "./citations";
+import { useDocumentAvailability } from "./use-document-availability";
 import {
   createConversation,
   getConversationStorageKey,
@@ -66,6 +67,7 @@ export function useChat() {
   const [requestError, setRequestError] = useState("");
   const [storageError, setStorageError] = useState("");
   const [conversation, setConversation] = useState<Conversation | null>(null);
+  const documentAvailability = useDocumentAvailability(conversation);
   const conversationRef = useRef<Conversation | null>(null);
   const activeRequestRef = useRef<ActiveRequest | null>(null);
   const persistenceRef = useRef(true);
@@ -356,6 +358,7 @@ export function useChat() {
     ready,
     error: [requestError, storageError].filter(Boolean).join(" "),
     conversation,
+    documentAvailability,
     askAI,
     clearConversation,
   };

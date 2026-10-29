@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import ts from "typescript";
-import { resolveCitations } from "../app/lib/chat-context/citations.ts";
+import { documentPath, resolveCitations } from "../app/lib/chat-context/citations.ts";
 
 const require = createRequire(import.meta.url);
 const react = require("react");
@@ -37,7 +37,7 @@ function renderChat(overrides = {}) {
   const loaded = { exports: {} };
   const localRequire = (id) => {
     if (id === "../lib/chat-context/use-chat") return { useChat: () => state };
-    if (id === "../lib/chat-context/citations") return { resolveCitations };
+    if (id === "../lib/chat-context/citations") return { documentPath, resolveCitations };
     if (id === "react") return {
       ...react,
       useEffect() {},
@@ -173,4 +173,29 @@ test("source names render as escaped plain text, never HTML or document links", 
   const html = renderChat({ conversation: { turns: [turn] } });
   assert.match(html, /&lt;img/);
   assert.doesNotMatch(html, /<img|href=/);
+});
+
+test("accessible PDF citations link to the ID route and cited page in a protected new tab", () => {
+  const id = "6e88c38545db0c9edf1a023928a50c36edb5e583aeec4690155da6986b7f106d";
+  const turn = completeTurn("first", "API?", "Answer [S1].");
+  turn.assistant.citations = [{ label: "[S1]", documentId: id, chunkId: "real-chunk", sourceName: "03_API_Guide.pdf", pageNumber: 3 }];
+  const html = renderChat({ conversation: { turns: [turn] }, documentAvailability: { [id]: true } });
+  assert.ok(html.includes(`href="/api/documents/${id}#page=3"`));
+  assert.match(html, /target="_blank"/);
+  assert.match(html, /rel="noopener noreferrer"/);
+  assert.match(html, /Open 03_API_Guide.pdf, page 3 \(new tab\)/);
+});
+
+test("missing, denied, and not-yet-checked PDF sources stay readable without broken links", () => {
+  const id = "a".repeat(64);
+  const turn = completeTurn("first", "Question", "Answer [S1].");
+  turn.assistant.citations = [{ label: "[S1]", documentId: id, chunkId: "chunk", sourceName: "Guide.pdf", pageNumber: 2 }];
+  for (const documentAvailability of [{}, { [id]: false }]) {
+    const html = renderChat({ conversation: { turns: [turn] }, documentAvailability });
+    assert.match(html, /Guide.pdf · Page 2/);
+    assert.doesNotMatch(html, /href=|target="_blank"/);
+  }
+  turn.assistant.citations[0].documentId = "../../private.pdf";
+  const html = renderChat({ conversation: { turns: [turn] }, documentAvailability: { "../../private.pdf": true } });
+  assert.doesNotMatch(html, /href=/);
 });

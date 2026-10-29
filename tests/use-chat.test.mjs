@@ -136,6 +136,7 @@ function mountChat({ saved, storageUnavailable = false, locks, storageEntries } 
     TextEncoder,
     TextDecoder,
     AbortController,
+    AbortSignal,
     queueMicrotask,
     fetch: (...args) => {
       fetchCalls.push(args);
@@ -336,6 +337,101 @@ test("citation metadata from an interrupted response never enters saved history 
   await app.state.askAI();
   await flush();
   assert.equal(app.saved.turns[0].assistant.citations, undefined);
+  app.unmount();
+});
+
+const accessibleDocumentId = "6e88c38545db0c9edf1a023928a50c36edb5e583aeec4690155da6986b7f106d";
+function pdfTurn(id = "pdf") {
+  const turn = completeTurn(id, "API limit?", "Answer [S1].");
+  turn.assistant.citations = [{ label: "[S1]", documentId: accessibleDocumentId, chunkId: "actual-chunk", sourceName: "03_API_Guide.pdf", pageNumber: 3 }];
+  return turn;
+}
+
+test("PDF availability checks reuse document IDs and do not run again on each render", async () => {
+  const app = mountChat({ saved: savedConversation([pdfTurn("first"), pdfTurn("second")]) });
+  app.setFetch(async (url, init) => {
+    assert.equal(url, `/api/documents/${accessibleDocumentId}`);
+    assert.equal(init.method, "HEAD");
+    assert.equal(init.credentials, "same-origin");
+    assert.equal(init.cache, "no-store");
+    const { HEAD } = await import("../app/api/documents/[documentId]/route.ts");
+    return HEAD(new Request(`http://localhost${url}`, { method: "HEAD" }), { params: Promise.resolve({ documentId: accessibleDocumentId }) });
+  });
+  await flush();
+  // The filesystem check finishes asynchronously; wait for that specific check.
+  for (let attempt = 0; attempt < 100 && !app.state.documentAvailability[accessibleDocumentId]; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(app.state.documentAvailability[accessibleDocumentId], true);
+  assert.equal(app.fetchCalls.length, 1);
+  await app.type("Next question");
+  assert.equal(app.fetchCalls.length, 1);
+  assert.equal(app.saved.turns.length, 2);
+  app.unmount();
+});
+
+test("unavailable, forbidden, incorrect-type, and failed availability responses leave links disabled", async () => {
+  for (const result of [
+    () => new Response(null, { status: 404 }), () => new Response(null, { status: 403 }),
+    () => new Response(null, { status: 500 }), () => new Response(null, { headers: { "Content-Type": "text/html" } }),
+    () => { throw new TypeError("network unavailable"); },
+  ]) {
+    const app = mountChat({ saved: savedConversation([pdfTurn()]) });
+    app.setFetch(async () => result());
+    await flush();
+    await flush();
+    assert.equal(app.state.documentAvailability[accessibleDocumentId], false);
+    assert.equal(app.state.error, "");
+    assert.equal(app.saved.turns[0].assistant.content, "Answer [S1].");
+    app.unmount();
+  }
+});
+
+test("document availability never blocks streamed text, successful completion, or source persistence", async () => {
+  const app = mountChat();
+  await flush();
+  const response = streamResponse();
+  let finishHead;
+  app.setFetch(async (_url, init) => init.method === "HEAD"
+    ? new Promise((resolve) => { finishHead = resolve; }) : response.response);
+  await app.type("API limit?");
+  const sending = app.state.askAI();
+  await flush();
+  response.content("Answer [S1].");
+  await flush();
+  assert.equal(app.state.reply, "Answer [S1].");
+  assert.equal(app.fetchCalls.length, 1);
+  response.citations(pdfTurn().assistant.citations);
+  response.done();
+  await sending;
+  await flush();
+  assert.equal(app.saved.turns[0].status, "complete");
+  assert.deepEqual(app.saved.turns[0].assistant.citations, pdfTurn().assistant.citations);
+  assert.equal(app.state.loading, false);
+  assert.equal(app.state.documentAvailability[accessibleDocumentId], undefined);
+  assert.equal(app.fetchCalls.filter(([, init]) => init.method === "POST").length, 1);
+  finishHead(new Response(null, { headers: { "Content-Type": "application/pdf" } }));
+  await flush();
+  assert.equal(app.state.documentAvailability[accessibleDocumentId], true);
+  app.unmount();
+});
+
+test("clearing a conversation aborts pending document checks and ignores late availability", async () => {
+  const app = mountChat({ saved: savedConversation([pdfTurn()]) });
+  let completeHead;
+  let checkSignal;
+  app.setFetch(async (_url, init) => {
+    checkSignal = init.signal;
+    return new Promise((resolve) => { completeHead = resolve; });
+  });
+  await flush();
+  app.state.clearConversation();
+  await flush();
+  assert.equal(checkSignal.aborted, true);
+  completeHead(new Response(null, { headers: { "Content-Type": "application/pdf" } }));
+  await flush();
+  assert.equal(app.state.documentAvailability[accessibleDocumentId], undefined);
+  assert.deepEqual(app.saved.turns, []);
   app.unmount();
 });
 

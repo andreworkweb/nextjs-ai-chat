@@ -43,3 +43,8 @@ export function resolveCitations(text: string, metadata: unknown): ChatCitation[
   }
   return [...resolved.values()];
 }
+
+/** Same-origin route only; the server independently enforces its PDF allowlist. */
+export function documentPath(documentId: string): string | undefined {
+  return /^[a-f0-9]{64}$/u.test(documentId) ? `/api/documents/${documentId}` : undefined;
+}

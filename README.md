@@ -543,8 +543,8 @@ correctness of a model's interpretation.
 No model calls, database searches, or document reads are added for citations.
 Text deltas are delivered as before; source selection and serialization happen
 after the last answer text, so citation work does not delay the first token.
-Private path prefixes are removed for display. Citations are plain text, with
-no generated document URLs or public links to private files.
+Private path prefixes are removed for display. Step 13.1 adds links only after
+the server confirms an explicitly public original PDF is available.
 
 The existing stream reader collects the optional metadata event, and `useChat`
 stores the verified citations on that specific completed assistant message.
@@ -570,3 +570,57 @@ For a manual check, run `npm run dev` and ask about TaskFlow's API rate limit.
 After streaming completes, valid markers should have a Sources list showing
 the actual document name and page. Reload and send another question to verify
 that earlier source lists remain attached to their original answers.
+
+## Open original PDF citations (Step 13.1)
+
+`GET /api/documents/[documentId]` serves original PDF bytes with
+`Content-Type: application/pdf` and `Content-Disposition: inline`. `HEAD` runs
+the same authorization and file checks without sending the PDF body. Both use
+private, no-store caching and return the same safe 404 for missing, inaccessible,
+invalid, or unauthorized documents.
+
+`src/lib/rag/documents.ts` contains an explicit allowlist of the five TaskFlow
+PDFs that were already tracked under `public/documents/taskflow/`. Their original
+bytes are in `data/documents/taskflow/`; the copies match exactly. Document IDs
+are the SHA-256 content IDs already used during ingestion and in citation maps.
+Requests never supply filesystem paths. Resolution verifies the allowlisted
+basename, canonical directory containment, regular-file status, PDF header,
+size, and content hash before returning bytes. Changed files require deliberate
+allowlist/hash updates and re-ingestion; stale IDs do not open a different version.
+
+This checkout has no account authentication or session-based document permissions.
+Only the already-public sample PDFs are permitted for anonymous visitors;
+private/unlisted documents are denied even when their ID is known. Adding a file
+to ingestion does not grant download access. The existing static public copies
+remain public. Any future restricted documents must stay outside `public/` and
+require server-side authorization shared by both GET and HEAD before access is
+enabled; marking an allowlist entry private currently denies it to everyone.
+
+The existing chat hook checks each distinct cited document in the background
+after message completion or history restoration. Until HEAD confirms a PDF, the
+source remains plain text. Failed, forbidden, missing, or non-PDF responses never
+enable links. Results are reused during the mounted chat session; GET rechecks
+access and the original bytes when clicked. Availability can naturally change
+between a check and a later click, so the serving route always validates again.
+
+Accessible citations open `/api/documents/<content-id>#page=N` in a new tab using
+`noopener noreferrer`. Page navigation depends on the browser PDF viewer. The
+original filename/page labels and existing chat styling remain unchanged.
+Streaming, citation metadata, and saved history use the existing implementation;
+no LLM calls, Qdrant searches, or first-token waiting are added for PDF links.
+
+`next.config.ts` explicitly includes only the allowlisted original PDFs in this
+API route's server file trace so they are available in the Vercel function bundle.
+Keep those originals in the deployed checkout; no new environment variables,
+credentials, document copies, or public upload directory are needed.
+
+Verify resolution, access denial, missing/changed files, link rendering, and
+non-blocking availability checks:
+
+```powershell
+node --test tests/documents.test.mjs tests/citations.test.mjs tests/chat-ui.test.mjs tests/use-chat.test.mjs
+```
+
+Run `npm run dev`, ask about the TaskFlow API, and click its Sources entry after
+it becomes available. The original PDF should open in a new tab at the cited page
+when supported. Reloading the conversation checks availability again.
