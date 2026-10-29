@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { mock, test } from "node:test";
 import { QdrantClient } from "@qdrant/js-client-rest";
+import { completionResponse } from "./helpers/openrouter-stream.mjs";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import ts from "typescript";
@@ -227,27 +228,30 @@ test("prior messages and responses are sent once and a streamed answer commits o
   app.unmount();
 });
 
-test("the real chat API streams an answer and preserves conversation history without RAG", async (t) => {
+test("the chat API streams grounded evidence and preserves stored conversation history", async (t) => {
   const { POST } = await import("../app/api/chat/route.ts");
   const originalKey = process.env.OPENROUTER_API_KEY;
-  const names = ["QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION"];
+  const names = ["QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION", "LLM_MODEL", "LLM_TIMEOUT_MS", "RAG_CONTEXT_TOKEN_BUDGET", "RAG_RERANK_ENABLED"];
   const originalQdrant = new Map(names.map((name) => [name, process.env[name]]));
   process.env.QDRANT_URL = "https://unit.eu-central.aws.cloud.qdrant.io:6333";
   process.env.QDRANT_API_KEY = "fake-qdrant-test-key";
   process.env.QDRANT_COLLECTION = "unit_documents";
-  const database = mock.method(QdrantClient.prototype, "query", async () => ({ points: [] }));
+  for (const name of ["LLM_MODEL", "LLM_TIMEOUT_MS", "RAG_CONTEXT_TOKEN_BUDGET"]) delete process.env[name];
+  process.env.RAG_RERANK_ENABLED = "false";
+  const database = mock.method(QdrantClient.prototype, "query", async () => ({ points: [{ id: "point", score: 0.9, payload: {
+    id: "chunk", documentId: "document", sourceName: "colors.txt", pageNumber: 1, chunkIndex: 0, text: "The project color is Blue.",
+  } }] }));
   process.env.OPENROUTER_API_KEY = "test-only-key";
   const upstream = mock.method(globalThis, "fetch", async (url, options) => {
     if (url === "https://openrouter.ai/api/v1/embeddings") {
       assert.deepEqual(JSON.parse(options.body).input, ["Which color?"]);
       return Response.json({ data: [{ index: 0, embedding: Array(1024).fill(0.25) }] });
     }
-    assert.deepEqual(JSON.parse(options.body).messages, [
-      { role: "user", content: "Remember blue" },
-      { role: "assistant", content: "I remember blue" },
-      { role: "user", content: "Which color?" },
-    ]);
-    return finishedResponse("Blue");
+    const messages = JSON.parse(options.body).messages;
+    assert.equal(messages[0].role, "system");
+    assert.equal(JSON.parse(messages[1].content).question, "Which color?");
+    assert.equal(JSON.parse(messages[1].content).documentContext.sources[0].text, "The project color is Blue.");
+    return completionResponse("Blue");
   });
   t.after(() => {
     upstream.mock.restore();

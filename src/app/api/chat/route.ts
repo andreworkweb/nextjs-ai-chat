@@ -1,136 +1,66 @@
 import { ChatQueryError, readChatQuery } from "../../../lib/rag/chat-request.ts";
-import { buildContext, MAX_COMPLETION_TOKENS } from "../../../../app/lib/chat-context/context.ts";
 import { embedQuery } from "../../../lib/rag/embed-query.ts";
 import { EmbeddingGenerationError } from "../../../lib/rag/generate-embeddings.ts";
 import { searchVectors } from "../../../lib/rag/search-vectors.ts";
 import { QdrantStorageError } from "../../../lib/rag/qdrant.ts";
-import type { VectorSearchResult } from "../../../lib/rag/types.ts";
 import { rerankChunks } from "../../../lib/rag/rerank-chunks.ts";
 import { buildPrompt, PromptConstructionError } from "../../../lib/rag/build-prompt.ts";
-import type { BuiltPrompt } from "../../../lib/rag/types.ts";
+import { AnswerGenerationError, generateAnswer } from "../../../lib/rag/generate-answer.ts";
 
-// next.config.ts enables cacheComponents, which requires the Node.js runtime.
-// This Next.js version rejects route-level runtime exports with that setting.
-const GENERATION_TIMEOUT_MS = 180_000;
+// cacheComponents requires Node.js and rejects route-level runtime exports.
+const REQUEST_TIMEOUT_MS = 180_000;
 
 function errorResponse(error: string, code: string, status: number, details?: ChatQueryError["details"]) {
-  return Response.json(
-    { error, code, ...(details ? { details } : {}) },
-    { status, headers: { "Cache-Control": "no-store" } },
-  );
+  return Response.json({ error, code, ...(details ? { details } : {}) }, {
+    status, headers: { "Cache-Control": "no-store" },
+  });
 }
 
 export async function POST(request: Request): Promise<Response> {
-  let generating = false;
   try {
     const query = await readChatQuery(request);
-    const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey) {
+    if (!process.env.OPENROUTER_API_KEY?.trim()) {
       return errorResponse("The AI service is not configured", "AI_NOT_CONFIGURED", 503);
     }
-
-    const signal = AbortSignal.any([
-      request.signal,
-      AbortSignal.timeout(GENERATION_TIMEOUT_MS),
-    ]);
-    // Keep the query vector and retrieved source passages on the server.
-    let queryVector: number[] | null = null;
-    try {
-      queryVector = await embedQuery(query.question, { signal });
-    } catch (error) {
-      signal.throwIfAborted();
-      // Keep ordinary chat available while the retrieval stage is being built.
-      if (!(error instanceof EmbeddingGenerationError)) throw error;
-    }
+    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
+    const queryVector = await embedQuery(query.question, { signal });
+    const retrievedChunks = await searchVectors(queryVector, { signal });
+    const selectedChunks = await rerankChunks(query.question, retrievedChunks, { signal });
     signal.throwIfAborted();
-    let retrievedChunks: VectorSearchResult[] | null = null;
-    if (queryVector) {
-      try {
-        retrievedChunks = await searchVectors(queryVector, { signal });
-      } catch (error) {
-        signal.throwIfAborted();
-        if (!(error instanceof QdrantStorageError)) throw error;
-      }
-    }
-    signal.throwIfAborted();
-    const selectedChunks = retrievedChunks === null ? null
-      : await rerankChunks(query.question, retrievedChunks, { signal });
-    signal.throwIfAborted();
-    // Prepare the RAG prompt locally. Sending it to the model is a later step;
-    // the existing ordinary chat path remains available independently.
-    let preparedPrompt: BuiltPrompt | null = null;
-    try {
-      preparedPrompt = buildPrompt(query.question, selectedChunks ?? []);
-    } catch (error) {
-      if (!(error instanceof PromptConstructionError)) throw error;
-    }
-    const messages = buildContext({ ...query, message: query.question });
-    generating = true;
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      cache: "no-store",
-      redirect: "error",
-      signal,
-      body: JSON.stringify({
-        model: "nvidia/nemotron-3-ultra-550b-a55b:free",
-        stream: true,
-        max_completion_tokens: MAX_COMPLETION_TOKENS,
-        messages,
-      }),
-    });
-
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => {});
-      if (response.status === 429) {
-        return errorResponse("The AI service is busy. Please try again shortly.", "AI_RATE_LIMITED", 429);
-      }
-      if (response.status === 400 || response.status === 413) {
-        return errorResponse(
-          "The AI service could not accept this context. Try a shorter message or start a new conversation.",
-          "AI_REQUEST_REJECTED",
-          400,
-        );
-      }
-      return errorResponse("OpenRouter request failed. Please try again.", "AI_UPSTREAM_ERROR", 502);
-    }
-    if (!response.body) {
-      return errorResponse("OpenRouter returned no stream", "AI_EMPTY_RESPONSE", 502);
-    }
-    return new Response(response.body, {
+    const prompt = buildPrompt(query.question, selectedChunks);
+    const answer = await generateAnswer(prompt, { signal });
+    // answer.sources retains the exact citation map from this prompt for Step 13.
+    // Only answer text is serialized here; internal prompts and provider data stay private.
+    return new Response(answer.stream, {
       headers: {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-store, no-transform",
         "X-Accel-Buffering": "no",
-        "X-RAG-Query-Status": queryVector ? "ready" : "unavailable",
-        "X-RAG-Search-Status": retrievedChunks === null ? "unavailable" : retrievedChunks.length ? "ready" : "empty",
-        "X-RAG-Retrieved-Chunks": String(retrievedChunks?.length ?? 0),
-        "X-RAG-Rerank-Status": selectedChunks?.some((chunk) => chunk.rerankScore !== undefined) ? "ready" : "original",
-        "X-RAG-Selected-Chunks": String(selectedChunks?.length ?? 0),
-        "X-RAG-Prompt-Status": preparedPrompt === null ? "unavailable" : preparedPrompt.includedChunkCount ? "ready" : "empty",
-        "X-RAG-Prompt-Sources": String(preparedPrompt?.includedChunkCount ?? 0),
+        "X-RAG-Query-Status": "ready",
+        "X-RAG-Search-Status": retrievedChunks.length ? "ready" : "empty",
+        "X-RAG-Retrieved-Chunks": String(retrievedChunks.length),
+        "X-RAG-Rerank-Status": selectedChunks.some((chunk) => chunk.rerankScore !== undefined) ? "ready" : "original",
+        "X-RAG-Selected-Chunks": String(selectedChunks.length),
+        "X-RAG-Prompt-Status": prompt.includedChunkCount ? "ready" : "empty",
+        "X-RAG-Prompt-Sources": String(Object.keys(answer.sources).length),
+        "X-RAG-Answer-Status": answer.status,
       },
     });
   } catch (error) {
-    if (request.signal.aborted) {
-      return errorResponse("The request was cancelled", "REQUEST_CANCELLED", 499);
-    }
-    if (error instanceof ChatQueryError) {
-      return errorResponse(error.message, error.code, error.status, error.details);
-    }
+    if (request.signal.aborted) return errorResponse("The request was cancelled", "REQUEST_CANCELLED", 499);
+    if (error instanceof ChatQueryError) return errorResponse(error.message, error.code, error.status, error.details);
+    if (error instanceof AnswerGenerationError) return errorResponse(error.message, error.code, error.status);
     if (error instanceof Error && error.name === "TimeoutError") {
-      return errorResponse("The AI service took too long to respond. Please try again.", "AI_TIMEOUT", 504);
+      return errorResponse("The request took too long to complete. Please try again.", "AI_TIMEOUT", 504);
     }
-    if (generating) {
-      return errorResponse("The AI service could not be reached. Please try again.", "AI_UNAVAILABLE", 502);
+    if (error instanceof PromptConstructionError) {
+      return errorResponse(error.code === "BUDGET_EXCEEDED"
+        ? "The question exceeds the configured context budget. Try a shorter question."
+        : "The document context could not be prepared.", "RAG_PROMPT_ERROR", error.code === "BUDGET_EXCEEDED" ? 400 : 503);
     }
-    return errorResponse(
-      "The chat request could not be processed. Please try again.",
-      "INTERNAL_ERROR",
-      500,
-    );
+    if (error instanceof EmbeddingGenerationError || error instanceof QdrantStorageError) {
+      return errorResponse("Document retrieval is temporarily unavailable. Please try again.", "RAG_UNAVAILABLE", 503);
+    }
+    return errorResponse("The chat request could not be processed. Please try again.", "INTERNAL_ERROR", 500);
   }
 }

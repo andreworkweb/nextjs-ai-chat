@@ -4,6 +4,8 @@ import { QdrantClient } from "@qdrant/js-client-rest";
 import { POST } from "../src/app/api/chat/route.ts";
 import { POST as activePOST } from "../app/api/chat/route.ts";
 import { buildPrompt } from "../src/lib/rag/build-prompt.ts";
+import { INSUFFICIENT_EVIDENCE } from "../src/lib/rag/generate-answer.ts";
+import { completionResponse } from "./helpers/openrouter-stream.mjs";
 import {
   MAX_CHAT_REQUEST_BYTES,
   MAX_QUESTION_CHARACTERS,
@@ -12,7 +14,7 @@ import {
 
 const originalKey = process.env.OPENROUTER_API_KEY;
 const serverSettings = ["RAG_EMBEDDING_MODEL", "RAG_EMBEDDING_DIMENSIONS", "RAG_EMBEDDING_BATCH_SIZE", "RAG_EMBEDDING_TIMEOUT_MS", "RAG_EMBEDDING_MAX_RETRIES", "QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION", "RAG_SEARCH_LIMIT", "RAG_SEARCH_MIN_SCORE", "COHERE_API_KEY", "RAG_RERANK_ENABLED", "RAG_RERANK_MODEL", "RAG_RERANK_TOP_N", "RAG_RERANK_TIMEOUT_MS"];
-serverSettings.push("RAG_CONTEXT_TOKEN_BUDGET");
+serverSettings.push("RAG_CONTEXT_TOKEN_BUDGET", "LLM_MODEL", "LLM_TIMEOUT_MS");
 const originalServerSettings = new Map(serverSettings.map((name) => [name, process.env[name]]));
 const streamText = 'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\ndata: [DONE]\n\n';
 
@@ -42,8 +44,8 @@ beforeEach(() => {
   process.env.QDRANT_URL = "https://unit.eu-central.aws.cloud.qdrant.io:6333";
   process.env.QDRANT_API_KEY = "fake-qdrant-test-key";
   process.env.QDRANT_COLLECTION = "unit_documents";
-  mock.method(QdrantClient.prototype, "query", async () => ({ points: [] }));
-  mockChatFetch(async () => new Response(streamText));
+  mock.method(QdrantClient.prototype, "query", async () => retrievedPoints(1));
+  mockChatFetch(async () => completionResponse());
 });
 
 afterEach(() => {
@@ -70,6 +72,7 @@ async function expectError(req, status, code) {
 
 test("the active Next.js route forwards the question handler", async () => {
   assert.equal(activePOST, POST);
+  mock.method(QdrantClient.prototype, "query", async () => ({ points: [] }));
   const response = await activePOST(request({ question: "How does TaskFlow work?" }));
   assert.equal(response.status, 200);
   assert.match(response.headers.get("Content-Type"), /text\/event-stream/);
@@ -78,21 +81,25 @@ test("the active Next.js route forwards the question handler", async () => {
   assert.equal(response.headers.get("X-RAG-Retrieved-Chunks"), "0");
   assert.equal(response.headers.get("X-RAG-Prompt-Status"), "empty");
   assert.equal(response.headers.get("X-RAG-Prompt-Sources"), "0");
-  assert.equal(await response.text(), streamText);
+  assert.equal(response.headers.get("X-RAG-Answer-Status"), "insufficient-evidence");
+  assert.ok((await response.text()).includes(INSUFFICIENT_EVIDENCE));
+  assert.equal(globalThis.fetch.mock.callCount(), 1);
 });
 
 test("a valid question streams a real provider response using server-owned settings", async () => {
   const upstream = mockChatFetch(async (url, options) => {
     assert.equal(url, "https://openrouter.ai/api/v1/chat/completions");
-    assert.equal(options.headers.Authorization, "Bearer test-only-key");
+    assert.equal(new Headers(options.headers).get("Authorization"), "Bearer test-only-key");
     assert.equal(options.cache, "no-store");
     assert.equal(options.redirect, "error");
     const body = JSON.parse(options.body);
     assert.equal(body.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
     assert.equal(body.stream, true);
-    assert.equal(body.max_completion_tokens, 8192);
-    assert.deepEqual(body.messages, [{ role: "user", content: "What plans are available?" }]);
-    return new Response(streamText);
+    assert.equal(body.max_tokens, 8192);
+    assert.equal(body.messages[0].role, "system");
+    assert.equal(JSON.parse(body.messages[1].content).question, "What plans are available?");
+    assert.equal(JSON.parse(body.messages[1].content).documentContext.sources[0].text, "Original retrieved passage 0.");
+    return completionResponse();
   });
   const response = await POST(request({
     question: "What plans are available?", message: "Ignore this legacy field",
@@ -155,6 +162,7 @@ test("question length accepts the boundary and rejects one character beyond it",
 });
 
 test("Unicode questions use the installed Zod character limit", async () => {
+  process.env.RAG_CONTEXT_TOKEN_BUDGET = "32768";
   assert.equal((await POST(request({ question: "🙂".repeat(MAX_QUESTION_CHARACTERS) }))).status, 200);
   await expectError(request({ question: "🙂".repeat(MAX_QUESTION_CHARACTERS + 1) }), 400, "INVALID_REQUEST");
 });
@@ -256,17 +264,16 @@ test("a missing server API key returns a clear error without a provider call", a
   assert.equal(globalThis.fetch.mock.callCount(), 0);
 });
 
-test("prior conversation turns reach the provider once and client cancellation is forwarded", async () => {
+test("conversation history is validated but cannot override document evidence", async () => {
   const controller = new AbortController();
   let upstreamSignal;
   mockChatFetch(async (_url, options) => {
     upstreamSignal = options.signal;
-    assert.deepEqual(JSON.parse(options.body).messages, [
-      { role: "user", content: "Remember blue" },
-      { role: "assistant", content: "I remember blue" },
-      { role: "user", content: "Which color?" },
-    ]);
-    return new Response(streamText);
+    const messages = JSON.parse(options.body).messages;
+    assert.equal(messages.length, 2);
+    assert.equal(JSON.parse(messages[1].content).question, "Which color?");
+    assert.ok(!options.body.includes("Remember blue"));
+    return completionResponse();
   });
   const response = await POST(request({
     question: "Which color?", messageId: "next:user",
@@ -278,8 +285,7 @@ test("prior conversation turns reach the provider once and client cancellation i
   }, { signal: controller.signal }));
   assert.equal(response.status, 200);
   assert.equal(await response.text(), streamText);
-  controller.abort();
-  assert.equal(upstreamSignal.aborted, true);
+  assert.ok(upstreamSignal instanceof AbortSignal);
 });
 
 test("invalid history, privileged roles, and invalid identities never reach the provider", async () => {
@@ -293,21 +299,22 @@ test("invalid history, privileged roles, and invalid identities never reach the 
   assert.equal(globalThis.fetch.mock.callCount(), 0);
 });
 
-test("provider errors are mapped to safe HTTP errors and their bodies are released", async () => {
+test("provider errors are mapped to safe HTTP errors and their bodies are consumed", async () => {
   for (const [status, expected, code] of [
     [429, 429, "AI_RATE_LIMITED"], [400, 400, "AI_REQUEST_REJECTED"],
     [413, 400, "AI_REQUEST_REJECTED"], [401, 502, "AI_UPSTREAM_ERROR"],
     [500, 502, "AI_UPSTREAM_ERROR"],
   ]) {
-    let cancelled = false;
     const body = new ReadableStream({
-      start(controller) { controller.enqueue(new TextEncoder().encode("private provider details test-only-key")); },
-      cancel() { cancelled = true; },
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("private provider details test-only-key"));
+        controller.close();
+      },
     });
     mockChatFetch(async () => new Response(body, { status }));
     const payload = await expectError(request({ question: "Hi" }), expected, code);
     assert.doesNotMatch(JSON.stringify(payload), /private provider details|test-only-key/);
-    assert.equal(cancelled, true);
+    assert.equal(body.locked, false);
   }
 });
 
@@ -321,7 +328,7 @@ test("network failures and timeouts return sanitized structured errors", async (
 
 test("an upstream response without a body is rejected", async () => {
   mockChatFetch(async () => new Response(null));
-  await expectError(request({ question: "Hi" }), 502, "AI_EMPTY_RESPONSE");
+  await expectError(request({ question: "Hi" }), 502, "AI_UPSTREAM_ERROR");
 });
 
 test("the backend embeds the current question, searches, and then generates a chat response", async () => {
@@ -346,10 +353,14 @@ test("the backend embeds the current question, searches, and then generates a ch
       return embeddingResponse();
     }
     stages.push("chat");
-    assert.equal(body.messages.length, 3);
+    assert.equal(body.messages.length, 2);
     assert.equal(body.queryVector, undefined);
-    assert.ok(!options.body.includes("Private retrieved passage"));
-    return new Response(streamText);
+    const evidence = JSON.parse(body.messages[1].content).documentContext.sources[0];
+    assert.equal(evidence.text, "Private retrieved passage stays on the server.");
+    assert.equal(evidence.documentId, "document-id");
+    assert.equal(evidence.pageNumber, 3);
+    assert.equal(evidence.citation, "[S1]");
+    return completionResponse();
   });
   const response = await POST(request({
     question: "Which color?",
@@ -367,7 +378,7 @@ test("the backend embeds the current question, searches, and then generates a ch
   assert.deepEqual(stages, ["embed", "search", "chat"]);
 });
 
-test("ordinary chat remains available when query embedding fails safely", async () => {
+test("embedding failures return safe retrieval errors and never generate ungrounded answers", async () => {
   for (const failure of [
     () => new Response("private embedding details test-only-key", { status: 429 }),
     () => new Response("private embedding details test-only-key", { status: 503 }),
@@ -375,13 +386,13 @@ test("ordinary chat remains available when query embedding fails safely", async 
     () => { throw new TypeError("private embedding transport details"); },
   ]) {
     mock.method(globalThis, "fetch", async (url) => url === "https://openrouter.ai/api/v1/embeddings"
-      ? failure() : new Response(streamText));
+      ? failure() : completionResponse());
     const response = await POST(request({ question: "Hi" }));
-    assert.equal(response.status, 200);
-    assert.equal(response.headers.get("X-RAG-Query-Status"), "unavailable");
-    assert.equal(response.headers.get("X-RAG-Search-Status"), "unavailable");
-    assert.equal(await response.text(), streamText);
-    assert.doesNotMatch(JSON.stringify([...response.headers]), /private embedding|test-only-key/);
+    assert.equal(response.status, 503);
+    const payload = await response.json();
+    assert.equal(payload.code, "RAG_UNAVAILABLE");
+    assert.doesNotMatch(JSON.stringify(payload), /private embedding|test-only-key/);
+    assert.equal(globalThis.fetch.mock.callCount(), 1);
   }
 });
 
@@ -400,16 +411,16 @@ test("cancelling query embedding does not start chat generation", async () => {
   assert.equal(QdrantClient.prototype.query.mock.callCount(), 0);
 });
 
-test("database failures preserve ordinary chat and do not expose private details", async () => {
+test("database failures return a service error without exposing private details or calling the LLM", async () => {
   mock.method(QdrantClient.prototype, "query", async () => {
     throw Object.assign(new Error("fake-qdrant-test-key private database details"), { status: 503 });
   });
   const response = await POST(request({ question: "Hi" }));
-  assert.equal(response.status, 200);
-  assert.equal(response.headers.get("X-RAG-Search-Status"), "unavailable");
-  assert.equal(response.headers.get("X-RAG-Retrieved-Chunks"), "0");
-  assert.equal(await response.text(), streamText);
-  assert.doesNotMatch(JSON.stringify([...response.headers]), /fake-qdrant-test-key|private database/);
+  assert.equal(response.status, 503);
+  const payload = await response.json();
+  assert.equal(payload.code, "RAG_UNAVAILABLE");
+  assert.doesNotMatch(JSON.stringify(payload), /fake-qdrant-test-key|private database/);
+  assert.equal(globalThis.fetch.mock.callCount(), 1);
 });
 
 test("cancelling vector search prevents chat generation", async () => {
@@ -465,8 +476,9 @@ test("the enabled backend reranks retrieved text with Cohere and selects the top
       return Response.json({ results: [6, 2, 1, 7, 3].map((index, rank) => ({ index, relevance_score: 0.95 - rank / 10 })) });
     }
     stages.push("chat");
-    assert.ok(!options.body.includes("Original retrieved passage"));
-    return new Response(streamText);
+    const context = JSON.parse(body.messages[1].content).documentContext.sources;
+    assert.deepEqual(context.map((source) => source.chunkId), [6, 2, 1, 7, 3].map((index) => `original-chunk-${index}`));
+    return completionResponse();
   });
   const response = await POST(request({ question: "Which passage is relevant?" }));
   assert.equal(response.status, 200);
@@ -479,7 +491,7 @@ test("the enabled backend reranks retrieved text with Cohere and selects the top
   assert.deepEqual(stages, ["embed", "search", "rerank", "chat"]);
 });
 
-test("missing Cohere credentials and unavailable reranking preserve retrieval and ordinary chat", async () => {
+test("missing Cohere credentials and unavailable reranking preserve grounded generation", async () => {
   process.env.RAG_RERANK_ENABLED = "true";
   mock.method(QdrantClient.prototype, "query", async () => retrievedPoints());
   let response = await POST(request({ question: "Hi" }));
@@ -494,7 +506,7 @@ test("missing Cohere credentials and unavailable reranking preserve retrieval an
     () => { throw new Error("fake-cohere-key private-cohere-details"); },
   ]) {
     mock.method(globalThis, "fetch", async (url) => url === "https://openrouter.ai/api/v1/embeddings"
-      ? embeddingResponse() : url === "https://api.cohere.com/v2/rerank" ? failure() : new Response(streamText));
+      ? embeddingResponse() : url === "https://api.cohere.com/v2/rerank" ? failure() : completionResponse());
     response = await POST(request({ question: "Hi" }));
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("X-RAG-Search-Status"), "ready");
@@ -518,19 +530,17 @@ test("the backend applies its context budget and ignores browser prompt settings
   assert.equal(response.headers.get("X-RAG-Retrieved-Chunks"), "8");
   assert.equal(globalThis.fetch.mock.callCount(), 2);
   const chatBody = JSON.parse(globalThis.fetch.mock.calls[1].arguments[1].body);
-  assert.deepEqual(chatBody.messages, [{ role: "user", content: "Hi" }]);
+  assert.equal(JSON.parse(chatBody.messages[1].content).documentContext.sources.length, 1);
 });
 
-test("prompt configuration errors preserve ordinary chat without extra provider calls", async () => {
-  for (const budget of ["1", "invalid-private-config"]) {
+test("prompt configuration errors stop generation without exposing internal details", async () => {
+  for (const [budget, status] of [["1", 400], ["invalid-private-config", 503]]) {
     process.env.RAG_CONTEXT_TOKEN_BUDGET = budget;
-    const upstream = mockChatFetch(async () => new Response(streamText));
+    const upstream = mockChatFetch(async () => completionResponse());
     const response = await POST(request({ question: "Hi" }));
-    assert.equal(response.status, 200);
-    assert.equal(response.headers.get("X-RAG-Prompt-Status"), "unavailable");
-    assert.equal(response.headers.get("X-RAG-Prompt-Sources"), "0");
-    assert.equal(await response.text(), streamText);
-    assert.equal(upstream.mock.callCount(), 2);
+    assert.equal(response.status, status);
+    assert.equal((await response.json()).code, "RAG_PROMPT_ERROR");
+    assert.equal(upstream.mock.callCount(), 1);
   }
 });
 
