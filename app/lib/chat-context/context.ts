@@ -3,7 +3,7 @@ import {
   MAX_HISTORY_BYTES,
   MAX_HISTORY_MESSAGES,
   MAX_MESSAGE_BYTES,
-} from "./types";
+} from "./types.ts";
 
 export const MAX_REQUEST_BYTES = 512 * 1024;
 export const MAX_COMPLETION_TOKENS = 8192;
@@ -19,6 +19,11 @@ const INPUT_BUDGET =
 const encoder = new TextEncoder();
 
 export type ProviderMessage = Pick<ChatMessage, "role" | "content">;
+
+/** Shared conservative estimate: UTF-8 content bytes plus message framing. */
+export function estimateMessageTokens(message: { content: string }): number {
+  return encoder.encode(message.content).byteLength + MESSAGE_OVERHEAD_TOKENS;
+}
 
 export class ChatContextError extends Error {
   readonly status: number;
@@ -135,10 +140,7 @@ export function parseChatRequest(value: unknown): ChatRequest {
 export function buildContext(request: ChatRequest): ProviderMessage[] {
   const history = request.history ?? [];
   const current: ProviderMessage = { role: "user", content: request.message };
-  let remaining =
-    INPUT_BUDGET -
-    encoder.encode(current.content).byteLength -
-    MESSAGE_OVERHEAD_TOKENS;
+  let remaining = INPUT_BUDGET - estimateMessageTokens(current);
   let historyBytes = 0;
   let start = history.length;
 

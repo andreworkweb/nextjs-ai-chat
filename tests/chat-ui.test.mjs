@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import ts from "typescript";
+import { documentPath, resolveCitations } from "../app/lib/chat-context/citations.ts";
 
 const require = createRequire(import.meta.url);
 const react = require("react");
@@ -36,6 +37,7 @@ function renderChat(overrides = {}) {
   const loaded = { exports: {} };
   const localRequire = (id) => {
     if (id === "../lib/chat-context/use-chat") return { useChat: () => state };
+    if (id === "../lib/chat-context/citations") return { documentPath, resolveCitations };
     if (id === "react") return {
       ...react,
       useEffect() {},
@@ -135,4 +137,65 @@ test("empty and restoring conversations keep the composer available with honest 
   const restoring = renderChat({ ready: false, conversation: null });
   assert.match(restoring, /Loading your conversation…/);
   assert.match(restoring, /<button[^>]*disabled=""[^>]*aria-label="Send message"/);
+});
+
+test("each assistant renders its own verified filename and page beneath the answer", () => {
+  const first = completeTurn("first", "API limit?", "60 requests [S1].");
+  first.assistant.citations = [{ label: "[S1]", documentId: "api-doc", chunkId: "api-chunk", sourceName: "private/03_API_Guide.pdf", pageNumber: 3 }];
+  const second = completeTurn("second", "Refunds?", "Annual refund policy [S1].");
+  second.assistant.citations = [{ label: "[S1]", documentId: "billing-doc", chunkId: "billing-chunk", sourceName: "02_Plans_and_Billing.pdf", pageNumber: 2 }];
+  const html = renderChat({ conversation: { turns: [first, second] } });
+  assert.equal(html.match(/aria-label="Sources for this answer"/g)?.length, 2);
+  assert.match(html, /03_API_Guide.pdf/);
+  assert.match(html, /Page 3/);
+  assert.match(html, /02_Plans_and_Billing.pdf/);
+  assert.match(html, /Page 2/);
+  assert.ok(html.indexOf("60 requests") < html.indexOf("03_API_Guide.pdf"));
+  assert.ok(html.indexOf("03_API_Guide.pdf") < html.indexOf("Refunds?"));
+  assert.ok(html.indexOf("Annual refund policy") < html.indexOf("02_Plans_and_Billing.pdf"));
+  assert.doesNotMatch(html, /private\/|href=|api-chunk|billing-doc/);
+});
+
+test("missing, invalid, or unused citation metadata never creates a source panel", () => {
+  const turn = completeTurn("first", "Question", "Unknown [S99].");
+  for (const citations of [undefined, [{ label: "[S1]", documentId: "doc", chunkId: "chunk", sourceName: "Unused.pdf", pageNumber: 1 }],
+    [{ label: "[S99]", documentId: "doc", chunkId: "chunk", sourceName: "Invalid.pdf", pageNumber: 0 }]]) {
+    turn.assistant.citations = citations;
+    const html = renderChat({ conversation: { turns: [turn] } });
+    assert.match(html, /Unknown \[S99\]/);
+    assert.doesNotMatch(html, /Sources for this answer|Unused.pdf|Invalid.pdf/);
+  }
+});
+
+test("source names render as escaped plain text, never HTML or document links", () => {
+  const turn = completeTurn("first", "Question", "Answer [S1].");
+  turn.assistant.citations = [{ label: "[S1]", documentId: "doc", chunkId: "chunk", sourceName: '<img onerror="alert(1)">.pdf', pageNumber: 1 }];
+  const html = renderChat({ conversation: { turns: [turn] } });
+  assert.match(html, /&lt;img/);
+  assert.doesNotMatch(html, /<img|href=/);
+});
+
+test("accessible PDF citations link to the ID route and cited page in a protected new tab", () => {
+  const id = "6e88c38545db0c9edf1a023928a50c36edb5e583aeec4690155da6986b7f106d";
+  const turn = completeTurn("first", "API?", "Answer [S1].");
+  turn.assistant.citations = [{ label: "[S1]", documentId: id, chunkId: "real-chunk", sourceName: "03_API_Guide.pdf", pageNumber: 3 }];
+  const html = renderChat({ conversation: { turns: [turn] }, documentAvailability: { [id]: true } });
+  assert.ok(html.includes(`href="/api/documents/${id}#page=3"`));
+  assert.match(html, /target="_blank"/);
+  assert.match(html, /rel="noopener noreferrer"/);
+  assert.match(html, /Open 03_API_Guide.pdf, page 3 \(new tab\)/);
+});
+
+test("missing, denied, and not-yet-checked PDF sources stay readable without broken links", () => {
+  const id = "a".repeat(64);
+  const turn = completeTurn("first", "Question", "Answer [S1].");
+  turn.assistant.citations = [{ label: "[S1]", documentId: id, chunkId: "chunk", sourceName: "Guide.pdf", pageNumber: 2 }];
+  for (const documentAvailability of [{}, { [id]: false }]) {
+    const html = renderChat({ conversation: { turns: [turn] }, documentAvailability });
+    assert.match(html, /Guide.pdf · Page 2/);
+    assert.doesNotMatch(html, /href=|target="_blank"/);
+  }
+  turn.assistant.citations[0].documentId = "../../private.pdf";
+  const html = renderChat({ conversation: { turns: [turn] }, documentAvailability: { "../../private.pdf": true } });
+  assert.doesNotMatch(html, /href=/);
 });

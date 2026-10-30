@@ -1,0 +1,4 @@
+TaskFlow document extraction sample.
+
+Starter includes CSV export through the web UI.
+Unicode text is preserved: Київ, café, 日本語, 🙂.

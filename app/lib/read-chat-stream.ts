@@ -1,3 +1,6 @@
+import { parseCitations } from "./chat-context/citations.ts";
+import type { ChatCitation } from "./chat-context/types.ts";
+
 // Events and UTF-8 characters can both span multiple network chunks.
 export async function readChatStream(
   body: ReadableStream<Uint8Array>,
@@ -6,6 +9,7 @@ export async function readChatStream(
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let citations: ChatCitation[] = [];
 
   function processEvent(event: string) {
     const data = event
@@ -21,6 +25,7 @@ export async function readChatStream(
     if (chunk.error || chunk.choices?.[0]?.finish_reason === "error") {
       throw new Error(chunk.error?.message || "Response generation failed");
     }
+    if (chunk.type === "citations") citations = parseCitations(chunk.citations);
     const content = chunk.choices?.[0]?.delta?.content;
     if (typeof content === "string") onContent(content);
     return false;
@@ -35,11 +40,11 @@ export async function readChatStream(
       while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
         const event = buffer.slice(0, boundary.index);
         buffer = buffer.slice(boundary.index + boundary[0].length);
-        if (processEvent(event)) return;
+        if (processEvent(event)) return citations;
       }
 
       if (done) {
-        if (buffer && processEvent(buffer)) return;
+        if (buffer && processEvent(buffer)) return citations;
         throw new Error("The response stream ended unexpectedly. Please try again.");
       }
     }

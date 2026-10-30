@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { test } from "node:test";
+import { mock, test } from "node:test";
+import { QdrantClient } from "@qdrant/js-client-rest";
+import { completionResponse } from "./helpers/openrouter-stream.mjs";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import ts from "typescript";
@@ -33,6 +35,9 @@ function streamResponse() {
     response: new Response(body, { headers: { "Content-Type": "text/event-stream" } }),
     content(text) {
       controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`));
+    },
+    citations(citations) {
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "citations", citations })}\n\n`));
     },
     done() { controller.enqueue(encoder.encode("data: [DONE]\n\n")); },
     interrupt() { controller.close(); },
@@ -131,6 +136,7 @@ function mountChat({ saved, storageUnavailable = false, locks, storageEntries } 
     TextEncoder,
     TextDecoder,
     AbortController,
+    AbortSignal,
     queueMicrotask,
     fetch: (...args) => {
       fetchCalls.push(args);
@@ -149,7 +155,7 @@ function mountChat({ saved, storageUnavailable = false, locks, storageEntries } 
     const localRequire = (id) => {
       if (id === "react") return react;
       if (!id.startsWith(".")) throw new Error(`Unexpected dependency: ${id}`);
-      return load(path.relative(project, path.resolve(path.dirname(file), `${id}.ts`)));
+      return load(path.relative(project, path.resolve(path.dirname(file), id.endsWith(".ts") ? id : `${id}.ts`)));
     };
     vm.runInContext(`(function(module, exports, require) { ${compiled.outputText}\n})`, context)(
       loaded, loaded.exports, localRequire,
@@ -209,6 +215,7 @@ test("prior messages and responses are sent once and a streamed answer commits o
   await flush();
   const payload = JSON.parse(app.fetchCalls[0][1].body);
   assert.equal(payload.message, "Which color?");
+  assert.equal(payload.question, "Which color?");
   assert.deepEqual(payload.history, [completeTurn("first").user, completeTurn("first").assistant]);
   assert.equal(app.saved.turns.length, 2);
   assert.equal(app.saved.turns[1].status, "pending");
@@ -222,6 +229,212 @@ test("prior messages and responses are sent once and a streamed answer commits o
   assert.equal(app.saved.turns[1].status, "complete");
   assert.equal(app.saved.turns[1].assistant.content, "Blue");
   assert.equal(app.state.loading, false);
+  app.unmount();
+});
+
+test("the chat API streams grounded evidence and preserves stored conversation history", async (t) => {
+  const { POST } = await import("../app/api/chat/route.ts");
+  const originalKey = process.env.OPENROUTER_API_KEY;
+  const names = ["QDRANT_URL", "QDRANT_API_KEY", "QDRANT_COLLECTION", "LLM_MODEL", "LLM_TIMEOUT_MS", "RAG_CONTEXT_TOKEN_BUDGET", "RAG_RERANK_ENABLED"];
+  const originalQdrant = new Map(names.map((name) => [name, process.env[name]]));
+  process.env.QDRANT_URL = "https://unit.eu-central.aws.cloud.qdrant.io:6333";
+  process.env.QDRANT_API_KEY = "fake-qdrant-test-key";
+  process.env.QDRANT_COLLECTION = "unit_documents";
+  for (const name of ["LLM_MODEL", "LLM_TIMEOUT_MS", "RAG_CONTEXT_TOKEN_BUDGET"]) delete process.env[name];
+  process.env.RAG_RERANK_ENABLED = "false";
+  const database = mock.method(QdrantClient.prototype, "query", async () => ({ points: [{ id: "point", score: 0.9, payload: {
+    id: "chunk", documentId: "document", sourceName: "colors.txt", pageNumber: 1, chunkIndex: 0, text: "The project color is Blue.",
+  } }] }));
+  process.env.OPENROUTER_API_KEY = "test-only-key";
+  const upstream = mock.method(globalThis, "fetch", async (url, options) => {
+    if (url === "https://openrouter.ai/api/v1/embeddings") {
+      assert.deepEqual(JSON.parse(options.body).input, ["Which color?"]);
+      return Response.json({ data: [{ index: 0, embedding: Array(1024).fill(0.25) }] });
+    }
+    const messages = JSON.parse(options.body).messages;
+    assert.equal(messages[0].role, "system");
+    assert.deepEqual(messages.slice(1, -1), [
+      { role: "user", content: "Remember blue" }, { role: "assistant", content: "I remember blue" },
+    ]);
+    assert.equal(JSON.parse(messages.at(-1).content).question, "Which color?");
+    assert.equal(JSON.parse(messages.at(-1).content).documentContext.sources[0].text, "The project color is Blue.");
+    return completionResponse("Blue");
+  });
+  t.after(() => {
+    upstream.mock.restore();
+    database.mock.restore();
+    if (originalKey === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = originalKey;
+    for (const [name, value] of originalQdrant) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+  const app = mountChat({ saved: savedConversation([completeTurn("first")]) });
+  await flush();
+  app.setFetch((url, init) => POST(new Request(`http://localhost${url}`, init)));
+  await app.type("Which color?");
+  await app.state.askAI();
+  await flush();
+  assert.equal(app.state.error, "");
+  assert.equal(app.state.loading, false);
+  assert.equal(app.state.reply, "Blue");
+  assert.equal(app.saved.turns[0].status, "complete");
+  assert.equal(app.saved.turns[1].status, "complete");
+  assert.equal(app.saved.turns[1].assistant.content, "Blue");
+  assert.equal(upstream.mock.callCount(), 2);
+  assert.equal(database.mock.callCount(), 1);
+  app.unmount();
+});
+
+test("citations stay with their answer through streaming, reload, and the next request", async () => {
+  const first = completeTurn("first", "API?", "First [S1].");
+  const firstCitation = { label: "[S1]", documentId: "first-doc", chunkId: "first-chunk", sourceName: "API.pdf", pageNumber: 3 };
+  first.assistant.citations = [firstCitation];
+  const app = mountChat({ saved: savedConversation([first]) });
+  await flush();
+  const response = streamResponse();
+  app.setFetch(async () => response.response);
+  await app.type("Billing?");
+  const sending = app.state.askAI();
+  await flush();
+  const body = JSON.parse(app.fetchCalls[0][1].body);
+  assert.equal(body.history[1].citations, undefined);
+  const secondCitation = { label: "[S1]", documentId: "billing-doc", chunkId: "billing-chunk", sourceName: "Billing.pdf", pageNumber: 2 };
+  response.content("Second [S");
+  await flush();
+  assert.equal(app.state.reply, "Second [S");
+  assert.equal(app.saved.turns[1].assistant, undefined);
+  response.content("1]. Invalid [S99].");
+  response.citations([secondCitation, { ...secondCitation, label: "[S2]", sourceName: "Uncited.pdf" }]);
+  await flush();
+  assert.equal(app.saved.turns[1].status, "pending");
+  response.done();
+  await sending;
+  await flush();
+  assert.deepEqual(app.saved.turns[0].assistant.citations, [firstCitation]);
+  assert.deepEqual(app.saved.turns[1].assistant.citations, [secondCitation]);
+  const restored = mountChat({ storageEntries: app.snapshotStorage() });
+  await flush();
+  assert.deepEqual(plain(restored.state.conversation), app.saved);
+  app.unmount();
+  restored.unmount();
+});
+
+test("citation metadata from an interrupted response never enters saved history or a retry", async () => {
+  const app = mountChat();
+  await flush();
+  const response = streamResponse();
+  app.setFetch(async () => response.response);
+  await app.type("Question");
+  const sending = app.state.askAI();
+  await flush();
+  response.content("Partial [S1]");
+  response.citations([{ label: "[S1]", documentId: "doc", chunkId: "chunk", sourceName: "Guide.pdf", pageNumber: 1 }]);
+  response.interrupt();
+  await sending;
+  await flush();
+  assert.equal(app.saved.turns[0].status, "failed");
+  assert.equal(app.saved.turns[0].assistant, undefined);
+  app.setFetch(async () => finishedResponse("Retry without citations"));
+  await app.state.askAI();
+  await flush();
+  assert.equal(app.saved.turns[0].assistant.citations, undefined);
+  app.unmount();
+});
+
+const accessibleDocumentId = "6e88c38545db0c9edf1a023928a50c36edb5e583aeec4690155da6986b7f106d";
+function pdfTurn(id = "pdf") {
+  const turn = completeTurn(id, "API limit?", "Answer [S1].");
+  turn.assistant.citations = [{ label: "[S1]", documentId: accessibleDocumentId, chunkId: "actual-chunk", sourceName: "03_API_Guide.pdf", pageNumber: 3 }];
+  return turn;
+}
+
+test("PDF availability checks reuse document IDs and do not run again on each render", async () => {
+  const app = mountChat({ saved: savedConversation([pdfTurn("first"), pdfTurn("second")]) });
+  app.setFetch(async (url, init) => {
+    assert.equal(url, `/api/documents/${accessibleDocumentId}`);
+    assert.equal(init.method, "HEAD");
+    assert.equal(init.credentials, "same-origin");
+    assert.equal(init.cache, "no-store");
+    const { HEAD } = await import("../app/api/documents/[documentId]/route.ts");
+    return HEAD(new Request(`http://localhost${url}`, { method: "HEAD" }), { params: Promise.resolve({ documentId: accessibleDocumentId }) });
+  });
+  await flush();
+  // The filesystem check finishes asynchronously; wait for that specific check.
+  for (let attempt = 0; attempt < 100 && !app.state.documentAvailability[accessibleDocumentId]; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(app.state.documentAvailability[accessibleDocumentId], true);
+  assert.equal(app.fetchCalls.length, 1);
+  await app.type("Next question");
+  assert.equal(app.fetchCalls.length, 1);
+  assert.equal(app.saved.turns.length, 2);
+  app.unmount();
+});
+
+test("unavailable, forbidden, incorrect-type, and failed availability responses leave links disabled", async () => {
+  for (const result of [
+    () => new Response(null, { status: 404 }), () => new Response(null, { status: 403 }),
+    () => new Response(null, { status: 500 }), () => new Response(null, { headers: { "Content-Type": "text/html" } }),
+    () => { throw new TypeError("network unavailable"); },
+  ]) {
+    const app = mountChat({ saved: savedConversation([pdfTurn()]) });
+    app.setFetch(async () => result());
+    await flush();
+    await flush();
+    assert.equal(app.state.documentAvailability[accessibleDocumentId], false);
+    assert.equal(app.state.error, "");
+    assert.equal(app.saved.turns[0].assistant.content, "Answer [S1].");
+    app.unmount();
+  }
+});
+
+test("document availability never blocks streamed text, successful completion, or source persistence", async () => {
+  const app = mountChat();
+  await flush();
+  const response = streamResponse();
+  let finishHead;
+  app.setFetch(async (_url, init) => init.method === "HEAD"
+    ? new Promise((resolve) => { finishHead = resolve; }) : response.response);
+  await app.type("API limit?");
+  const sending = app.state.askAI();
+  await flush();
+  response.content("Answer [S1].");
+  await flush();
+  assert.equal(app.state.reply, "Answer [S1].");
+  assert.equal(app.fetchCalls.length, 1);
+  response.citations(pdfTurn().assistant.citations);
+  response.done();
+  await sending;
+  await flush();
+  assert.equal(app.saved.turns[0].status, "complete");
+  assert.deepEqual(app.saved.turns[0].assistant.citations, pdfTurn().assistant.citations);
+  assert.equal(app.state.loading, false);
+  assert.equal(app.state.documentAvailability[accessibleDocumentId], undefined);
+  assert.equal(app.fetchCalls.filter(([, init]) => init.method === "POST").length, 1);
+  finishHead(new Response(null, { headers: { "Content-Type": "application/pdf" } }));
+  await flush();
+  assert.equal(app.state.documentAvailability[accessibleDocumentId], true);
+  app.unmount();
+});
+
+test("clearing a conversation aborts pending document checks and ignores late availability", async () => {
+  const app = mountChat({ saved: savedConversation([pdfTurn()]) });
+  let completeHead;
+  let checkSignal;
+  app.setFetch(async (_url, init) => {
+    checkSignal = init.signal;
+    return new Promise((resolve) => { completeHead = resolve; });
+  });
+  await flush();
+  app.state.clearConversation();
+  await flush();
+  assert.equal(checkSignal.aborted, true);
+  completeHead(new Response(null, { headers: { "Content-Type": "application/pdf" } }));
+  await flush();
+  assert.equal(app.state.documentAvailability[accessibleDocumentId], undefined);
+  assert.deepEqual(app.saved.turns, []);
   app.unmount();
 });
 

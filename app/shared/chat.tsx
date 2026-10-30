@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { useChat } from "../lib/chat-context/use-chat";
+import { documentPath, resolveCitations } from "../lib/chat-context/citations";
 
 function ChatIcon({ className = "size-5" }: { className?: string }) {
   return (
@@ -23,7 +24,7 @@ function ChatIcon({ className = "size-5" }: { className?: string }) {
 export default function Chat() {
   const {
     message, setMessage, reply, loading, ready, error, conversation, askAI,
-    clearConversation,
+    clearConversation, documentAvailability,
   } = useChat();
   const threadRef = useRef<HTMLElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -107,6 +108,7 @@ export default function Chat() {
                 const isStreaming = loading && turn.status === "pending"
                   && index === turns.length - 1;
                 const answer = turn.assistant?.content ?? (isStreaming ? reply : "");
+                const citations = resolveCitations(answer, turn.assistant?.citations);
 
                 return [
                   <li key={turn.user.id} className="flex justify-end">
@@ -137,6 +139,29 @@ export default function Chat() {
                             "Response interrupted. Send your message again to retry."
                           )}
                         </p>
+                      )}
+                      {citations.length > 0 && (
+                        <div className="mt-3 border-t border-white/10 pt-3 text-xs leading-5 text-[#a3a3a3]">
+                          <p className="mb-1 font-medium text-[#b4b4b4]">Sources</p>
+                          <ul aria-label="Sources for this answer" className="space-y-1">
+                            {citations.map((citation) => {
+                              const file = documentAvailability?.[citation.documentId] ? documentPath(citation.documentId) : undefined;
+                              const label = <><span className="font-medium">{citation.label}</span>{" "}
+                                {citation.sourceName} · Page {citation.pageNumber}</>;
+                              return (
+                                <li key={citation.label} className="[overflow-wrap:anywhere]">
+                                  {file ? (
+                                    <a href={`${file}#page=${citation.pageNumber}`} target="_blank" rel="noopener noreferrer"
+                                      className="underline decoration-white/30 underline-offset-2 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2"
+                                      aria-label={`Open ${citation.sourceName}, page ${citation.pageNumber} (new tab)`}>
+                                      {label}
+                                    </a>
+                                  ) : label}
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        </div>
                       )}
                     </div>
                   </li>,

@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import { PUBLIC_DOCUMENTS } from "./src/lib/rag/documents.ts";
 
 const nextConfig: NextConfig = {
   /* config options here */
@@ -7,6 +8,9 @@ const nextConfig: NextConfig = {
   },
   cacheComponents: true,
   partialPrefetching: true,
+  outputFileTracingIncludes: {
+    "/api/documents/*": PUBLIC_DOCUMENTS.map(({ fileName }) => `./data/documents/taskflow/${fileName}`),
+  },
   turbopack: {
     rules: {
       "*.css": {

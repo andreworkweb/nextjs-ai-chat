@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { readChatStream } from "../read-chat-stream";
+import { resolveCitations } from "./citations";
+import { useDocumentAvailability } from "./use-document-availability";
 import {
   createConversation,
   getConversationStorageKey,
@@ -49,7 +51,7 @@ function recentHistory(conversation: Conversation): ChatMessage[] {
     bytes += turnBytes;
   }
 
-  return history;
+  return history.map(({ id, role, content }) => ({ id, role, content }));
 }
 
 function storageMessage(error: unknown): string {
@@ -65,6 +67,7 @@ export function useChat() {
   const [requestError, setRequestError] = useState("");
   const [storageError, setStorageError] = useState("");
   const [conversation, setConversation] = useState<Conversation | null>(null);
+  const documentAvailability = useDocumentAvailability(conversation);
   const conversationRef = useRef<Conversation | null>(null);
   const activeRequestRef = useRef<ActiveRequest | null>(null);
   const persistenceRef = useRef(true);
@@ -256,7 +259,7 @@ export function useChat() {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
+          body: JSON.stringify({ ...body, question: body.message }),
           signal: request.controller.signal,
         });
         if (!response.ok) {
@@ -269,13 +272,14 @@ export function useChat() {
         if (!response.body) throw new Error("Response body is not readable");
 
         let answer = "";
-        await readChatStream(response.body, (content) => {
+        const metadata = await readChatStream(response.body, (content) => {
           if (!isCurrent()) return;
           answer += content;
           setReply(answer);
         });
         if (!isCurrent()) return;
         if (!answer.trim()) throw new Error("The AI returned an empty response. Please try again.");
+        const citations = resolveCitations(answer, metadata);
 
         // Check both success and failure before saving; storage events may lag.
         if (!canSaveResult()) return;
@@ -283,7 +287,8 @@ export function useChat() {
           ...pending,
           turns: pending.turns.map((item) => item.id === turnId ? {
             ...item,
-            assistant: { id: `${turnId}:assistant`, role: "assistant", content: answer },
+            assistant: { id: `${turnId}:assistant`, role: "assistant", content: answer,
+              ...(citations.length ? { citations } : {}) },
             status: "complete",
           } : item),
         });
@@ -353,6 +358,7 @@ export function useChat() {
     ready,
     error: [requestError, storageError].filter(Boolean).join(" "),
     conversation,
+    documentAvailability,
     askAI,
     clearConversation,
   };
